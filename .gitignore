@@ -1,0 +1,41 @@
+# Environnement (SECRETS - NE JAMAIS POUSSER)
+.env
+.env.local
+.env.*.local
+
+# Dépendances
+node_modules/
+
+# Build
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+
+# Environnement virtuel Python
+venv/
+env/
+.venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environnement (SECRETS)
+.env
+.env.local
+.env.*.local
+
+celerybeat-schedule*
+*.sql
