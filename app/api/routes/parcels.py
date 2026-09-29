@@ -6,10 +6,21 @@ Chaque parcelle est rattachée à une ferme et possède :
   - des métadonnées agronomiques (culture, sol, irrigation)
   - un masque colorisé (COG) généré automatiquement
   - optionnellement des composites Sentinel-2 (RGB + NDVI), avec historique
+  - 14 indices spectraux (NDVI, NDMI, NDWI, NDRE, EVI, SAVI, MSAVI,
+    NBR, REDEDGE, VARI, CARBONATE, SI_SOIL, PSRI, FCOVER)
 
 `status` (état agronomique) et `raster_status` (état du traitement des
 rasters) sont deux champs indépendants : ne jamais écrire l'un à la place
 de l'autre.
+
+Déclencheurs Celery :
+  - Création / modification de géométrie :
+      → generate_parcel_rasters (masque + RGB + NDVI)
+      → ingest_parcel_indices  (14 indices spectraux)
+  - Route manuelle POST /parcels/{id}/refresh :
+      → ingest_parcel_indices uniquement
+  - Celery Beat quotidien 6h :
+      → ingest_all_active_parcels (toutes les parcelles)
 """
 
 import json
@@ -20,6 +31,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.models.farm import Farm
+from app.models.parcel import Parcel
 from app.db.database import get_db
 from app.models.utilisateur import User
 from app.api.routes.auth import get_current_user
@@ -91,6 +104,39 @@ def _parcel_to_response(parcel_row, raster_urls: dict) -> ParcelResponse:
     )
 
 
+def _launch_ingestion_tasks(parcel_id: int) -> None:
+    """
+    Lance les 2 tâches Celery pour une parcelle :
+      - generate_parcel_rasters (masque + RGB + NDVI)
+      - ingest_parcel_indices  (14 indices spectraux)
+
+    Gère les cas où Celery n'est pas configuré (warning, pas d'exception).
+    """
+    try:
+        from app.tasks.parcel_tasks import generate_parcel_rasters_task
+        from app.tasks.ingestion_tasks import ingest_parcel_indices_task
+
+        if generate_parcel_rasters_task is not None:
+            generate_parcel_rasters_task.delay(parcel_id)
+            logger.info("Tâche generate_rasters lancée pour parcel_id=%s", parcel_id)
+        else:
+            logger.warning(
+                "Celery indisponible : rasters non générés pour parcel_id=%s",
+                parcel_id,
+            )
+
+        if ingest_parcel_indices_task is not None:
+            ingest_parcel_indices_task.delay(parcel_id)
+            logger.info("Tâche ingest_indices lancée pour parcel_id=%s", parcel_id)
+        else:
+            logger.warning(
+                "Celery indisponible : indices non générés pour parcel_id=%s",
+                parcel_id,
+            )
+    except Exception:
+        logger.exception("Échec du lancement des tâches Celery")
+
+
 # ----------------------------------------------------------------------
 # GET /parcels — liste
 # ----------------------------------------------------------------------
@@ -120,38 +166,6 @@ def list_parcels(
         _parcel_to_response(r, _fetch_raster_urls_for_parcel(db, r.id))
         for r in rows
     ]
-
-
-# ----------------------------------------------------------------------
-# GET /parcels/{parcel_id} — détail
-# ----------------------------------------------------------------------
-
-
-@router.get("/{parcel_id}", response_model=ParcelResponse)
-def get_parcel(
-    parcel_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    row = db.execute(
-        text("""
-            SELECT
-                p.id, p.farm_id, p.name,
-                p.culture_type, p.soil_type, p.irrigation_type,
-                p.status, p.raster_status, p.created_at,
-                ST_Area(p.geom::geography) / 10000.0 AS area_ha
-            FROM parcel p
-            JOIN farm f ON f.id = p.farm_id
-            WHERE p.id = :parcel_id AND f.user_id = :user_id
-        """),
-        {"parcel_id": parcel_id, "user_id": current_user.id},
-    ).fetchone()
-
-    if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Parcelle introuvable")
-
-    raster_urls = _fetch_raster_urls_for_parcel(db, parcel_id)
-    return _parcel_to_response(row, raster_urls)
 
 
 # ----------------------------------------------------------------------
@@ -205,17 +219,8 @@ def create_parcel(
     ).fetchone()
     db.commit()
 
-    try:
-        from app.tasks.parcel_tasks import generate_parcel_rasters_task
-
-        if generate_parcel_rasters_task is not None:
-            generate_parcel_rasters_task.delay(row.id)
-        else:
-            logger.warning(
-                "Celery indisponible : rasters non générés pour parcel_id=%s", row.id
-            )
-    except Exception:
-        logger.exception("Échec du lancement de la tâche Celery")
+    # 🆕 Lance les DEUX tâches (rasters + 14 indices)
+    _launch_ingestion_tasks(row.id)
 
     return ParcelResponse(
         id=row.id,
@@ -232,6 +237,148 @@ def create_parcel(
         raster_status=row.raster_status,
         created_at=row.created_at,
     )
+
+
+# ----------------------------------------------------------------------
+# POST /parcels/{parcel_id}/refresh — ingestion des 14 indices
+# ----------------------------------------------------------------------
+
+
+@router.post("/{parcel_id}/refresh")
+async def refresh_parcel_indices(
+    parcel_id: int,
+    force_refresh: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Déclenche l'ingestion des 14 indices spectraux pour une parcelle.
+
+    - **parcel_id** : id de la parcelle
+    - **force_refresh** : si True, ignore le cache et remplace même si
+                          la scène existante a moins de nuages
+
+    Retourne immédiatement (tâche Celery lancée en arrière-plan).
+    Pour suivre le statut, consulter `parcel.raster_status` ou les logs.
+    """
+    # Vérifier que la parcelle appartient à l'utilisateur
+    parcel = (
+        db.query(Parcel)
+        .join(Farm)
+        .filter(Parcel.id == parcel_id, Farm.user_id == current_user.id)
+        .first()
+    )
+    if not parcel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Parcelle introuvable.",
+        )
+
+    # Marquer la parcelle comme "en cours"
+    parcel.raster_status = "pending"
+    db.commit()
+
+    # Lancer la tâche Celery (import différé pour éviter un import circulaire)
+    from app.tasks.ingestion_tasks import ingest_parcel_indices_task
+
+    if ingest_parcel_indices_task is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Celery n'est pas configuré. Ingestion impossible.",
+        )
+
+    try:
+        task = ingest_parcel_indices_task.delay(
+            parcel_id=parcel_id, force_refresh=force_refresh
+        )
+    except Exception as e:
+        parcel.raster_status = "failed"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Impossible de lancer la tâche Celery : {e}",
+        )
+
+    return {
+        "parcel_id": parcel_id,
+        "task_id": task.id,
+        "status": "pending",
+        "force_refresh": force_refresh,
+        "message": (
+            "Ingestion des 14 indices lancée en arrière-plan. "
+            "Suivre via /parcels/{id}/raster_status ou les logs Celery."
+        ),
+    }
+
+
+# ----------------------------------------------------------------------
+# GET /parcels/{parcel_id}/raster_status — statut des rasters
+# ----------------------------------------------------------------------
+
+
+@router.get("/{parcel_id}/raster_status")
+async def get_parcel_raster_status(
+    parcel_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Retourne le statut de génération des rasters d'une parcelle.
+
+    Valeurs possibles :
+      - "pending" : tâche en cours
+      - "ready"   : génération terminée avec succès
+      - "failed"  : erreur pendant la génération
+      - None      : jamais générée
+    """
+    parcel = (
+        db.query(Parcel)
+        .join(Farm)
+        .filter(Parcel.id == parcel_id, Farm.user_id == current_user.id)
+        .first()
+    )
+    if not parcel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Parcelle introuvable.",
+        )
+
+    return {
+        "parcel_id": parcel_id,
+        "raster_status": getattr(parcel, "raster_status", None),
+    }
+
+
+# ----------------------------------------------------------------------
+# GET /parcels/{parcel_id} — détail
+# ----------------------------------------------------------------------
+
+
+@router.get("/{parcel_id}", response_model=ParcelResponse)
+def get_parcel(
+    parcel_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text("""
+            SELECT
+                p.id, p.farm_id, p.name,
+                p.culture_type, p.soil_type, p.irrigation_type,
+                p.status, p.raster_status, p.created_at,
+                ST_Area(p.geom::geography) / 10000.0 AS area_ha
+            FROM parcel p
+            JOIN farm f ON f.id = p.farm_id
+            WHERE p.id = :parcel_id AND f.user_id = :user_id
+        """),
+        {"parcel_id": parcel_id, "user_id": current_user.id},
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Parcelle introuvable")
+
+    raster_urls = _fetch_raster_urls_for_parcel(db, parcel_id)
+    return _parcel_to_response(row, raster_urls)
 
 
 # ----------------------------------------------------------------------
@@ -289,14 +436,9 @@ def update_parcel(
         )
         db.commit()
 
+        # 🆕 Si la géométrie a changé, relance les DEUX tâches
         if payload.geometry is not None:
-            try:
-                from app.tasks.parcel_tasks import generate_parcel_rasters_task
-
-                if generate_parcel_rasters_task is not None:
-                    generate_parcel_rasters_task.delay(parcel_id)
-            except Exception:
-                logger.exception("Échec du lancement de la tâche Celery")
+            _launch_ingestion_tasks(parcel_id)
 
     row = db.execute(
         text("""

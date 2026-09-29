@@ -16,6 +16,10 @@ Améliorations de qualité :
 - Resampling bilinear pour les overviews et reprojections
 - UPSAMPLING à 5 m (depuis 10 m natif) pour un rendu plus doux au zoom
 - Compression DEFLATE optimisée (PREDICTOR=2, LEVEL=9)
+
+⚠️  Deux pipelines cohabitent dans ce fichier :
+    1. Pipeline historique (RGB + NDVI)   → generate_sentinel_composites_for_parcel()
+    2. Pipeline étendu (14 indices)       → generate_all_indices_for_parcel()
 """
 
 # ----------------------------------------------------------------------
@@ -45,6 +49,26 @@ from sqlalchemy.orm import Session
 # Imports internes
 # ----------------------------------------------------------------------
 from app.services.b2_storage import upload_file_to_b2
+
+# --- Nouveaux imports pour les 14 indices ---
+from app.services.cog_writer import (
+    INDICE_PALETTES,
+    build_b2_keys,
+    get_palette,
+    write_all_cogs,
+)
+from app.services.indices.calculator import compute_all_indices
+from app.services.indices.registry import (
+    MULTIBAND_ORDER,
+    SEPARATE_COGS,
+    filter_available_indices,
+    get_indice,
+    list_indice_names,
+)
+from app.services.zonal_stats import (
+    compute_zonal_stats_with_validation,
+    fetch_parcel_geometry_wkt,
+)
 
 # ----------------------------------------------------------------------
 # Configuration logging & warnings
@@ -101,6 +125,13 @@ SCL_MASK_VALUES = {
     10,  # Thin cirrus
     11,  # Snow / ice
 }
+
+
+# ======================================================================
+# ======================================================================
+# PIPELINE HISTORIQUE — RGB + NDVI
+# ======================================================================
+# ======================================================================
 
 
 # ----------------------------------------------------------------------
@@ -326,7 +357,7 @@ def _compute_blocksize(height: int, width: int) -> int:
 
 
 # ----------------------------------------------------------------------
-# Écriture COG
+# Écriture COG (pipeline historique)
 # ----------------------------------------------------------------------
 
 
@@ -431,7 +462,7 @@ def _write_single_band_cog(
 
 
 # ----------------------------------------------------------------------
-# Point d'entrée public
+# Point d'entrée public (pipeline historique RGB + NDVI)
 # ----------------------------------------------------------------------
 
 
@@ -576,3 +607,607 @@ def generate_sentinel_composites_for_parcel(
         "cloud_cover": cloud_cover,
         "bbox": bbox,
     }
+
+
+# ======================================================================
+# ======================================================================
+# NOUVELLE SECTION — INGESTION DES 14 INDICES SPECTRAUX
+# ======================================================================
+# ======================================================================
+#
+# Cette section étend le pipeline existant (RGB + NDVI) pour calculer
+# les 14 indices spectraux, écrire les 4 COG (3 séparés + 1 multi-bande),
+# les uploader sur B2 et insérer les stats dans `indice_reading`.
+#
+# Architecture hybride :
+#   - 3 COG séparés (visuels) : NDVI, NDMI, NDWI
+#   - 1 COG multi-bande (11)  : NDRE, EVI, SAVI, MSAVI, NBR,
+#                                REDEDGE, VARI, CARBONATE, SI_SOIL,
+#                                PSRI, FCOVER
+#
+# ⚠️  La fonction `generate_sentinel_composites_for_parcel()` ci-dessus
+#     reste INCHANGÉE (rétro-compatibilité RGB + NDVI seuls).
+# ======================================================================
+
+
+# ----------------------------------------------------------------------
+# Configuration spécifique aux 14 indices
+# ----------------------------------------------------------------------
+
+# Toutes les bandes requises par au moins un indice
+ALL_BANDS_FOR_INDICES = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12"]
+
+
+# ----------------------------------------------------------------------
+# Helpers : récupération des infos parcel
+# ----------------------------------------------------------------------
+
+
+def _get_farm_id_for_parcel(db: Session, parcel_id: int) -> int | None:
+    """Récupère le farm_id d'une parcelle (ou None si introuvable)."""
+    row = db.execute(
+        text("SELECT farm_id FROM parcel WHERE id = :parcel_id"),
+        {"parcel_id": parcel_id},
+    ).fetchone()
+    return row.farm_id if row else None
+
+
+# ----------------------------------------------------------------------
+# ÉTAPE 1 — Téléchargement de TOUTES les bandes nécessaires
+# ----------------------------------------------------------------------
+
+
+def _download_all_bands(
+    item,
+    bbox: tuple[float, float, float, float],
+    target_resolution: float = TARGET_RESOLUTION_M,
+) -> tuple[dict[str, np.ndarray], np.ndarray | None, "rioxarray.DataArray"]:
+    """
+    Télécharge les 8 bandes + SCL, les aligne sur la grille de B04.
+
+    Returns:
+        (bands_dict, cloud_mask, ref_da)
+          - bands_dict : {"B02": arr, "B03": arr, ..., "B12": arr}
+          - cloud_mask : masque SCL (True = nuage) aligné sur B04, ou None
+          - ref_da     : DataArray de référence (B04) pour transform/crs
+    """
+    # Vérifier les bandes manquantes
+    available = set(item.assets.keys())
+    missing = [b for b in ALL_BANDS_FOR_INDICES if b not in available]
+    if missing:
+        logger.warning(
+            "[Indices] Bandes manquantes dans la scène : %s", missing
+        )
+
+    # On télécharge uniquement les bandes présentes
+    bands_to_load = [b for b in ALL_BANDS_FOR_INDICES if b in available]
+
+    if BAND_RED not in bands_to_load:
+        raise ValueError(
+            "B04 (Red) obligatoire manquante — impossible d'aligner les bandes"
+        )
+
+    # Charger B04 en premier (référence de grille)
+    ref_da = _clip_band_to_bbox(
+        item, BAND_RED, bbox, target_resolution=target_resolution
+    )
+
+    bands_dict: dict[str, np.ndarray] = {}
+    bands_dict[BAND_RED] = ref_da.values[0].astype("float32")
+
+    # Charger les autres bandes alignées sur B04
+    for band in bands_to_load:
+        if band == BAND_RED:
+            continue
+        try:
+            da = _clip_band_to_bbox(
+                item, band, bbox, target_resolution=target_resolution
+            )
+            da = da.rio.reproject_match(ref_da, resampling=Resampling.bilinear)
+            bands_dict[band] = da.values[0].astype("float32")
+        except Exception as e:
+            logger.warning("[Indices] Échec chargement %s : %s", band, e)
+
+    # Charger SCL (nearest, PAS d'upsampling)
+    cloud_mask: np.ndarray | None = None
+    try:
+        scl_da = _clip_band_to_bbox(item, BAND_SCL, bbox, target_resolution=None)
+        scl_da = scl_da.rio.reproject_match(ref_da, resampling=Resampling.nearest)
+        scl_arr = scl_da.values[0]
+        cloud_mask = np.isin(scl_arr, list(SCL_MASK_VALUES))
+        masked_count = int(cloud_mask.sum())
+        total = cloud_mask.size
+        logger.info(
+            "[Indices] Masque SCL : %d/%d pixels masqués (%.1f%%)",
+            masked_count, total, 100.0 * masked_count / max(total, 1),
+        )
+    except Exception as e:
+        logger.warning("[Indices] SCL indisponible, pas de masque nuages : %s", e)
+
+    return bands_dict, cloud_mask, ref_da
+
+
+# ----------------------------------------------------------------------
+# ÉTAPE 2 — Application du masque SCL sur toutes les bandes
+# ----------------------------------------------------------------------
+
+
+def _apply_cloud_mask(
+    bands: dict[str, np.ndarray],
+    cloud_mask: np.ndarray | None,
+) -> dict[str, np.ndarray]:
+    """
+    Applique le masque SCL (True = nuage) sur toutes les bandes.
+
+    Les pixels nuageux deviennent NaN.
+    """
+    if cloud_mask is None:
+        return bands
+
+    masked: dict[str, np.ndarray] = {}
+    for band, arr in bands.items():
+        arr_m = np.where(cloud_mask, np.nan, arr).astype("float32")
+        masked[band] = arr_m
+    return masked
+
+
+# ----------------------------------------------------------------------
+# ÉTAPE 3 — Cache : vérifier si une scène est déjà ingérée
+# ----------------------------------------------------------------------
+
+
+def _check_scene_in_cache(
+    db: Session,
+    parcel_id: int,
+    scene_id: str,
+) -> tuple[bool, float | None]:
+    """
+    Vérifie si une scène est déjà ingérée pour cette parcelle.
+
+    Returns:
+        (already_exists, existing_cloud_cover)
+    """
+    row = db.execute(
+        text("""
+            SELECT cloud_cover
+            FROM indice_reading
+            WHERE parcel_id = :parcel_id AND scene_id = :scene_id
+            LIMIT 1
+        """),
+        {"parcel_id": parcel_id, "scene_id": scene_id},
+    ).fetchone()
+
+    if row is None:
+        return False, None
+    return True, row.cloud_cover
+
+
+# ----------------------------------------------------------------------
+# ÉTAPE 4 — Suppression des anciennes lignes (si remplacement)
+# ----------------------------------------------------------------------
+
+
+def _delete_scene_readings(
+    db: Session,
+    parcel_id: int,
+    scene_id: str,
+) -> int:
+    """Supprime toutes les lignes d'une scène donnée. Retourne le nb supprimé."""
+    result = db.execute(
+        text("""
+            DELETE FROM indice_reading
+            WHERE parcel_id = :parcel_id AND scene_id = :scene_id
+        """),
+        {"parcel_id": parcel_id, "scene_id": scene_id},
+    )
+    return result.rowcount
+
+
+# ----------------------------------------------------------------------
+# ÉTAPE 5 — Insertion en base (une ligne par indice)
+# ----------------------------------------------------------------------
+
+
+def _insert_indice_readings(
+    db: Session,
+    parcel_id: int,
+    scene_id: str,
+    scene_date,
+    cloud_cover: float | None,
+    recorded_at,
+    stats_by_indice: dict[str, dict],
+    b2_keys: dict[str, str],
+) -> int:
+    """
+    Insère les lignes `indice_reading` pour chaque indice calculé.
+
+    Returns:
+        Nombre de lignes insérées.
+    """
+    inserted = 0
+
+    def b2_key_for(indice_name: str) -> str | None:
+        lower = indice_name.lower()
+        if lower in b2_keys:
+            return b2_keys[lower]
+        if indice_name in MULTIBAND_ORDER.values():
+            return b2_keys.get("multiband")
+        return None
+
+    for indice_name, stats in stats_by_indice.items():
+        spec = get_indice(indice_name)
+
+        db.execute(
+            text("""
+                INSERT INTO indice_reading (
+                    parcel_id, indice_name,
+                    value, min_value, max_value, std_value, median_value,
+                    valid_pixels, cloud_pixels, total_pixels, valid_ratio,
+                    theoretical_min, theoretical_max,
+                    is_valid, validation_error,
+                    scene_id, scene_date, cloud_cover, b2_key,
+                    recorded_at
+                )
+                VALUES (
+                    :parcel_id, :indice_name,
+                    :value, :min_value, :max_value, :std_value, :median_value,
+                    :valid_pixels, :cloud_pixels, :total_pixels, :valid_ratio,
+                    :theoretical_min, :theoretical_max,
+                    :is_valid, :validation_error,
+                    :scene_id, :scene_date, :cloud_cover, :b2_key,
+                    :recorded_at
+                )
+            """),
+            {
+                "parcel_id": parcel_id,
+                "indice_name": indice_name,
+                "value": stats.get("mean"),
+                "min_value": stats.get("min"),
+                "max_value": stats.get("max"),
+                "std_value": stats.get("std"),
+                "median_value": stats.get("median"),
+                "valid_pixels": stats.get("valid_pixels", 0),
+                "cloud_pixels": stats.get("cloud_pixels", 0),
+                "total_pixels": stats.get("total_pixels", 0),
+                "valid_ratio": stats.get("valid_ratio", 0.0),
+                "theoretical_min": spec.theoretical_min,
+                "theoretical_max": spec.theoretical_max,
+                "is_valid": stats.get("is_valid", True),
+                "validation_error": stats.get("validation_error"),
+                "scene_id": scene_id,
+                "scene_date": scene_date,
+                "cloud_cover": cloud_cover,
+                "b2_key": b2_key_for(indice_name),
+                "recorded_at": recorded_at,
+            },
+        )
+        inserted += 1
+
+    return inserted
+
+
+# ----------------------------------------------------------------------
+# FONCTION PRINCIPALE — génération des 14 indices
+# ----------------------------------------------------------------------
+
+
+def generate_all_indices_for_parcel(
+    db: Session,
+    farm_id: int,
+    parcel_id: int,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    target_resolution: float = TARGET_RESOLUTION_M,
+    *,
+    force_refresh: bool = False,
+) -> dict | None:
+    """
+    Génère les 14 indices spectraux pour une parcelle et insère les stats.
+
+    Flux :
+      1. Recherche STAC (meilleure scène)
+      2. Vérification cache (skip ou remplace selon cloud_cover)
+      3. Téléchargement des 8 bandes + SCL
+      4. Masquage SCL
+      5. Calcul des 14 indices
+      6. Écriture des 4 COG (3 séparés + 1 multi-bande)
+      7. Upload B2
+      8. Stats zonales (polygone exact) + validation
+      9. Insertion en base
+
+    Args:
+        force_refresh: si True, ignore le cache et remplace même si la
+                       scène existante a moins de nuages.
+
+    Returns:
+        dict avec :
+          - scene_id, scene_date, cloud_cover
+          - inserted : nombre de lignes insérées
+          - skipped  : nombre d'indices skippés
+          - b2_keys  : dict des clés B2
+          - indices_calculated : liste des indices calculés
+          - indices_skipped    : dict {indice: raison}
+        ou None si aucune scène / aucune géométrie.
+    """
+    # ------------------------------------------------------------------
+    # 0. Vérifs préliminaires
+    # ------------------------------------------------------------------
+    bbox = _get_bbox_for_parcel(db, parcel_id)
+    if bbox is None:
+        logger.info("[Indices] Parcelle %s sans géométrie", parcel_id)
+        return None
+
+    parcel_wkt = fetch_parcel_geometry_wkt(db, parcel_id)
+    if parcel_wkt is None:
+        logger.info("[Indices] Parcelle %s sans WKT exploitable", parcel_id)
+        return None
+
+    logger.info("[Indices] Bbox parcelle %s : %s", parcel_id, bbox)
+
+    # ------------------------------------------------------------------
+    # 1. Recherche STAC
+    # ------------------------------------------------------------------
+    item = _search_best_scene(bbox, lookback_days=lookback_days)
+    if item is None:
+        logger.info("[Indices] Aucune scène trouvée pour parcel %s", parcel_id)
+        return None
+
+    scene_id = item.id
+    scene_date_str = item.properties.get("datetime", "")[:10]
+    cloud_cover = item.properties.get("eo:cloud_cover")
+
+    logger.info(
+        "[Indices] Scène retenue : %s (clouds=%.4f%%)",
+        scene_id, cloud_cover if cloud_cover is not None else -1,
+    )
+
+
+    # ------------------------------------------------------------------
+    # 2. Vérification cache
+    # ------------------------------------------------------------------
+    already, existing_cloud = _check_scene_in_cache(db, parcel_id, scene_id)
+
+    if already:
+        if force_refresh:
+            # force_refresh=True → on supprime systématiquement
+            deleted = _delete_scene_readings(db, parcel_id, scene_id)
+            logger.info(
+                "[Indices] force_refresh=True → REMPLACE (%d lignes supprimées)",
+                deleted,
+            )
+        elif (
+            existing_cloud is not None
+            and cloud_cover is not None
+            and cloud_cover >= existing_cloud
+        ):
+            # La nouvelle scène est moins bonne → SKIP
+            logger.info(
+                "[Indices] Scène déjà ingérée avec clouds=%.4f%% ≤ nouvelle (%.4f%%) → SKIP",
+                existing_cloud, cloud_cover,
+            )
+            return {
+                "scene_id": scene_id,
+                "scene_date": scene_date_str,
+                "cloud_cover": cloud_cover,
+                "inserted": 0,
+                "skipped": 0,
+                "cached": True,
+                "b2_keys": {},
+                "indices_calculated": [],
+                "indices_skipped": {},
+            }
+        else:
+            # La nouvelle scène est meilleure → REMPLACE
+            deleted = _delete_scene_readings(db, parcel_id, scene_id)
+            logger.info(
+                "[Indices] Scène déjà ingérée mais nouvelle moins nuageuse → REMPLACE (%d lignes supprimées)",
+                deleted,
+            )
+
+    # ------------------------------------------------------------------
+    # 3. Téléchargement des bandes
+    # ------------------------------------------------------------------
+    bands, cloud_mask, ref_da = _download_all_bands(
+        item, bbox, target_resolution=target_resolution
+    )
+
+    available_bands = set(bands.keys())
+    indices_calculables = filter_available_indices(available_bands)
+    logger.info(
+        "[Indices] %d/%d indices calculables (bandes dispo : %s)",
+        len(indices_calculables), len(list_indice_names()),
+        sorted(available_bands),
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Masquage SCL
+    # ------------------------------------------------------------------
+    bands_masked = _apply_cloud_mask(bands, cloud_mask)
+
+    # ------------------------------------------------------------------
+    # 5. Calcul des 14 indices
+    # ------------------------------------------------------------------
+    results = compute_all_indices(bands_masked)
+
+    indices_ok: dict[str, np.ndarray] = {}
+    indices_skipped: dict[str, str] = {}
+
+    for name, (arr, err) in results.items():
+        if err is not None or arr is None:
+            indices_skipped[name] = err or "raison inconnue"
+            logger.warning("[Indices] %s SKIP — %s", name, err)
+        else:
+            indices_ok[name] = arr
+
+    logger.info(
+        "[Indices] %d calculés, %d skippés",
+        len(indices_ok), len(indices_skipped),
+    )
+
+    if not indices_ok:
+        logger.warning("[Indices] Aucun indice calculable pour parcel %s", parcel_id)
+        return {
+            "scene_id": scene_id,
+            "scene_date": scene_date_str,
+            "cloud_cover": cloud_cover,
+            "inserted": 0,
+            "skipped": len(indices_skipped),
+            "b2_keys": {},
+            "indices_calculated": [],
+            "indices_skipped": indices_skipped,
+        }
+
+    # ------------------------------------------------------------------
+    # 6. Écriture des 4 COG
+    # ------------------------------------------------------------------
+    transform = ref_da.rio.transform()
+    crs = ref_da.rio.crs
+
+    can_write_cogs = (
+        all(n in indices_ok for n in SEPARATE_COGS)
+        and all(n in indices_ok for n in MULTIBAND_ORDER.values())
+    )
+
+    b2_keys: dict[str, str] = {}
+    cog_paths: dict[str, str] = {}
+
+    if can_write_cogs:
+        try:
+            cog_paths = write_all_cogs(
+                indices_ok, transform, crs, scene_date=scene_date_str,
+            )
+            b2_keys = build_b2_keys(farm_id, parcel_id, scene_date_str)
+            logger.info("[Indices] COG écrits : %s", sorted(cog_paths.keys()))
+        except Exception as e:
+            logger.exception("[Indices] Échec écriture COG : %s", e)
+            cog_paths = {}
+            b2_keys = {}
+    else:
+        missing = [
+            n for n in list(SEPARATE_COGS) + list(MULTIBAND_ORDER.values())
+            if n not in indices_ok
+        ]
+        logger.warning(
+            "[Indices] COG NON écrits (indices manquants : %s)", missing
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Upload B2
+    # ------------------------------------------------------------------
+    b2_urls: dict[str, str] = {}
+    if cog_paths and b2_keys:
+        for key, local_path in cog_paths.items():
+            try:
+                url = upload_file_to_b2(local_path, b2_keys[key])
+                b2_urls[key] = url
+                logger.info("[Indices] Upload B2 OK : %s", b2_keys[key])
+            except Exception as e:
+                logger.exception("[Indices] Échec upload B2 %s : %s", key, e)
+
+    # ------------------------------------------------------------------
+    # 8. Stats zonales
+    # ------------------------------------------------------------------
+    stats_by_indice: dict[str, dict] = {}
+    for name, arr in indices_ok.items():
+        spec = get_indice(name)
+        try:
+            stats = compute_zonal_stats_with_validation(
+                arr=arr,
+                transform=transform,
+                raster_crs=crs,
+                parcel_geometry=parcel_wkt,
+                theoretical_min=spec.theoretical_min,
+                theoretical_max=spec.theoretical_max,
+                cloud_mask=cloud_mask,
+            )
+            stats_by_indice[name] = stats
+        except Exception as e:
+            logger.exception("[Indices] Échec stats %s : %s", name, e)
+            indices_skipped[name] = f"stats: {e}"
+
+    # ------------------------------------------------------------------
+    # 9. Insertion en base
+    # ------------------------------------------------------------------
+    from datetime import datetime as _datetime, timezone as _timezone, date as _date
+    scene_date_obj = None
+    recorded_at = None
+    try:
+        scene_date_obj = _date.fromisoformat(scene_date_str)
+        recorded_at = item.datetime or _datetime.now(_timezone.utc)
+    except Exception:
+        pass
+
+    inserted = 0
+    if stats_by_indice:
+        try:
+            inserted = _insert_indice_readings(
+                db=db,
+                parcel_id=parcel_id,
+                scene_id=scene_id,
+                scene_date=scene_date_obj,
+                cloud_cover=cloud_cover,
+                recorded_at=recorded_at,
+                stats_by_indice=stats_by_indice,
+                b2_keys=b2_keys,
+            )
+            db.commit()
+            logger.info("[Indices] %d lignes insérées en base", inserted)
+        except Exception as e:
+            db.rollback()
+            logger.exception("[Indices] Échec insertion DB : %s", e)
+
+    return {
+        "scene_id": scene_id,
+        "scene_date": scene_date_str,
+        "cloud_cover": cloud_cover,
+        "inserted": inserted,
+        "skipped": len(indices_skipped),
+        "cached": False,
+        "b2_keys": b2_keys,
+        "b2_urls": b2_urls,
+        "indices_calculated": sorted(indices_ok.keys()),
+        "indices_skipped": indices_skipped,
+    }
+
+
+# ----------------------------------------------------------------------
+# Wrapper public (utilisé par les tâches Celery)
+# ----------------------------------------------------------------------
+
+
+def generate_all_indices_for_parcel_safe(
+    parcel_id: int,
+    *,
+    force_refresh: bool = False,
+) -> dict | None:
+    """
+    Version safe de `generate_all_indices_for_parcel` qui ouvre sa propre
+    session DB et la ferme proprement.
+
+    Utilisée par les tâches Celery (`ingestion_tasks.py`).
+    """
+    from app.db.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        farm_id = _get_farm_id_for_parcel(db, parcel_id)
+        if farm_id is None:
+            logger.warning("[Indices] Parcelle %s introuvable", parcel_id)
+            return None
+        return generate_all_indices_for_parcel(
+            db=db,
+            farm_id=farm_id,
+            parcel_id=parcel_id,
+            force_refresh=force_refresh,
+        )
+    finally:
+        db.close()
+
+
+# ----------------------------------------------------------------------
+# Endpoint utilitaire — palettes à renvoyer au frontend
+# ----------------------------------------------------------------------
+
+
+def get_all_indice_palettes() -> dict[str, list[list[int | float]]]:
+    """Récupère toutes les palettes des 14 indices (pour le frontend)."""
+    return dict(INDICE_PALETTES)

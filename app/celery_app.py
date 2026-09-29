@@ -18,6 +18,7 @@ celery_app = Celery(
     include=[
         "app.tasks.agenda_tasks",
         "app.tasks.parcel_tasks",
+        "app.tasks.ingestion_tasks",   # 🆕 14 indices spectraux
     ],
 )
 
@@ -79,15 +80,32 @@ celery_app.conf.task_routes = {
     "app.tasks.agenda_tasks.*":  {"queue": "awam_queues:agenda"},
     "parcels.*": {"queue": "awam_queues:parcelles"},
     "app.tasks.parcel_tasks.*":  {"queue": "awam_queues:parcelles"},
+    "app.tasks.ingestion_tasks.*": {"queue": "awam_queues:parcelles"},  # 🆕
 }
 
 # ------------------------------------------------------------------
 # BEAT (planificateur)
 # ------------------------------------------------------------------
 celery_app.conf.beat_schedule = {
+    # ------------------------------------------------------------------
+    # Rappels d'agenda (existant) — toutes les 15 min
+    # ------------------------------------------------------------------
     "check-agenda-reminders": {
         "task": "app.tasks.agenda_tasks.check_and_send_reminders",
         "schedule": crontab(minute="*/15"),
         "options": {"queue": "awam_queues:agenda"},
+    },
+
+    # ------------------------------------------------------------------
+    # 🆕 Ingestion quotidienne des 14 indices spectraux
+    #    Tous les jours à 6h du matin (heure Tunis)
+    # ------------------------------------------------------------------
+    "ingest-parcel-indices-daily": {
+        "task": "parcels.ingest_all_active_parcels",
+        "schedule": crontab(hour=6, minute=0),
+        "options": {
+            "queue": "awam_queues:parcelles",
+            "expires": 3600,  # expire après 1h si pas exécutée (évite l'accumulation)
+        },
     },
 }
