@@ -1,1 +1,1 @@
-https://s3.us-east-005.backblazeb2.com/awam-raster/rasters/farm_8/parcel_63/sentinel_rgb/2026-09-09_858fd290.tif?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=005a094887ed0bd0000000002%2F20260927%2Fus-east-005%2Fs3%2Faws4_request&X-Amz-Date=20260927T161521Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=5a38bb22b06dbcdd334f0d116b2fb431c70caec3aefa9d62d840197f694b6fa5
+
