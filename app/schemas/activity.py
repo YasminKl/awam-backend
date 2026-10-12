@@ -27,13 +27,18 @@ class ActivityCreate(BaseModel):
         if not v:
             raise ValueError("Au moins un employé doit être associé à l'activité.")
         return v
-
+    
+    @field_validator("performed_at")
+    @classmethod
+    def performed_at_has_timezone(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is None:
+            return v
+        if v.tzinfo is None:
+            raise ValueError("La date doit inclure une information de fuseau horaire.")
+        return v
 
 class ActivityUpdate(BaseModel):
-    """
-    Mise à jour partielle d'une activité.
-    Tous les champs sont optionnels.
-    """
+    parcel_id: Optional[int] = None
     activity_type: Optional[str] = None
     performed_at: Optional[datetime] = None
     employee_ids: Optional[List[int]] = None
@@ -58,7 +63,6 @@ class ActivityUpdate(BaseModel):
         if not v:
             raise ValueError("Au moins un employé doit être associé à l'activité.")
         return v
-
 
 class ActivityResponse(BaseModel):
     id: int

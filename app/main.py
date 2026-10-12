@@ -37,6 +37,7 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.profile import router as profile_router
 from app.db.database import SessionLocal
 from app.models.utilisateur import User
+from sqlalchemy import func  # ⬅️ CASSE E-MAIL
 
 from app.api.routes.parcels import router as parcels_router
 from app.api.routes.vector_layers import router as vector_layers_router
@@ -49,9 +50,12 @@ from app.api.routes.agenda import router as agenda_router
 from app.api.routes.indices import router as indices_router
 from app.api.routes.alerts import router as alerts_router
 from app.api.routes.employees import router as employees_router
+from app.api.routes.farm_employees import router as farm_employees_router  # ⬅️ AJOUT
 from app.api.routes.activities import router as activities_router
 from app.api.routes.weather import router as weather_router
-
+from app.api.routes.parcel_analyses import router as parcel_analyses_router
+from app.api.routes.crops import router as crops_router
+from app.api.routes.diagnosis import router as diagnosis_router
 
 print("🔵 Lancement de l'application FastAPI...")
 
@@ -114,11 +118,23 @@ app.include_router(alerts_router, prefix="/api")
 print("🔵 Ajout du router employees...")
 app.include_router(employees_router, prefix="/api")
 
+print("🔵 Ajout du router farm_employees...")  # ⬅️ AJOUT
+app.include_router(farm_employees_router, prefix="/api")  # ⬅️ AJOUT
+
 print("🔵 Ajout du router activities...")
 app.include_router(activities_router, prefix="/api")
 
 print("🔵 Ajout du router weather...")
 app.include_router(weather_router, prefix="/api")
+
+print("🔵 Ajout du router parcel_analyses...")
+app.include_router(parcel_analyses_router, prefix="/api")
+
+print("🔵 Ajout du router crops...")
+app.include_router(crops_router, prefix="/api")
+
+print("🔵 Ajout du router diagnosis...")
+app.include_router(diagnosis_router, prefix="/api")
 
 # ==================================================================
 # Titiler
@@ -146,7 +162,7 @@ def bootstrap_admin():
             print("🔴 ADMIN_EMAIL n'est pas défini dans .env")
             return
 
-        user = db.query(User).filter(User.email == ADMIN_EMAIL).first()
+        user = db.query(User).filter(func.lower(User.email) == ADMIN_EMAIL).first()  # ⬅️ CASSE E-MAIL
         if not user:
             print(f"🔴 Aucun utilisateur trouvé avec l'email {ADMIN_EMAIL}")
             return

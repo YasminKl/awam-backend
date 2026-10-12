@@ -5,6 +5,8 @@ Responsabilités :
   1. Ingérer les 14 indices pour UNE parcelle (à la demande)
   2. Ingérer les 14 indices pour TOUTES les parcelles actives (cron quotidien)
   3. Mettre à jour parcel.raster_status en fonction du résultat
+  4. Tâche quotidienne : aligner l'image de la carte sur la date des
+     indices (la régénérer seulement si elle est plus ancienne)
 
 Déclencheurs :
   - Celery Beat quotidien (6h) → ingest_all_active_parcels
@@ -48,6 +50,64 @@ def _set_raster_status(db, parcel_id: int, raster_status: str) -> None:
         text("UPDATE parcel SET raster_status = :raster_status WHERE id = :parcel_id"),
         {"raster_status": raster_status, "parcel_id": parcel_id},
     )
+
+
+def _latest_map_date(db, parcel_id: int) -> str | None:
+    """Date (AAAA-MM-JJ) de la dernière image de la carte, ou None."""
+    row = db.execute(
+        text("""
+            SELECT MAX(scene_date) AS last_date
+            FROM raster
+            WHERE parcel_id = :parcel_id AND raster_type = 'sentinel_rgb'
+        """),
+        {"parcel_id": parcel_id},
+    ).fetchone()
+    if row is None or row.last_date is None:
+        return None
+    return str(row.last_date)[:10]
+
+
+def _sync_map_with_indices(db, parcel_id: int, indices_date) -> str:
+    """
+    Aligne l'image de la carte sur la date des indices.
+
+    La carte n'est régénérée que si elle est absente ou plus ancienne que
+    les indices : on ne refait pas chaque matin une image identique. Les
+    deux traitements utilisent la même sélection de scène
+    (`_select_usable_scene`), ils retombent donc sur la même date.
+
+    Returns:
+        "aligned"    : la carte est déjà à jour, rien à faire
+        "launched"   : la génération de la carte a été lancée
+        "no_indices" : pas de date d'indices, rien à comparer
+    """
+    if not indices_date:
+        return "no_indices"
+
+    indices_day = str(indices_date)[:10]
+    map_day = _latest_map_date(db, parcel_id)
+
+    # Dates ISO : la comparaison de chaînes suit l'ordre chronologique
+    if map_day is not None and map_day >= indices_day:
+        return "aligned"
+
+    logger.info(
+        "🗺️ [ingestion] Carte à régénérer (parcel_id=%s, carte=%s, indices=%s)",
+        parcel_id, map_day or "aucune", indices_day,
+    )
+
+    # Import différé : évite tout import circulaire entre les deux modules
+    from app.tasks.parcel_tasks import (
+        generate_parcel_rasters,
+        generate_parcel_rasters_task,
+    )
+
+    if generate_parcel_rasters_task is not None:
+        generate_parcel_rasters_task.delay(parcel_id)
+    else:
+        generate_parcel_rasters(parcel_id)
+
+    return "launched"
 
 
 # ======================================================================
@@ -163,7 +223,20 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
             result["skipped"],
             result["cached"],
         )
+         # ------------------------------------------------------------------
+        # 3 bis. Diagnostiquer et archiver les cultures de la parcelle
+        # Alimente la règle des deux observations et les notifications.
+        # ------------------------------------------------------------------
+        try:
+            from app.services.crop_monitoring import archive_for_parcel
 
+            result["diagnoses_archived"] = archive_for_parcel(db, parcel_id)
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "⚠️ [ingestion] Archivage du diagnostic impossible (parcel_id=%s)",
+                parcel_id,
+            )
         # ------------------------------------------------------------------
         # 4. Mettre à jour raster_status
         # ------------------------------------------------------------------
@@ -202,13 +275,16 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
 
 def ingest_all_active_parcels(*, force_refresh: bool = False) -> dict:
     """
-    Ingère les 14 indices pour TOUTES les parcelles actives.
+    Ingère les 14 indices pour toutes les parcelles ACTIVES (status = 'active').
+    Une parcelle inactive ne reçoit aucune analyse satellite.
 
-    "Actives" = parcelles existantes en base (on peut affiner plus tard
-    avec un filtre : status='active', ou raster_status != 'failed', etc.).
+    Après les indices de chaque parcelle, l'image de la carte est alignée
+    sur la même date (voir `_sync_map_with_indices`). Ce n'est fait qu'ici :
+    le bouton « Rafraîchir », la création et l'activation d'une parcelle
+    lancent déjà eux-mêmes la génération de la carte.
 
     Returns:
-        dict {total, ok, failed, skipped_cached, results: [...]}
+        dict {total, ok, failed, skipped_cached, maps_launched, results: [...]}
     """
     db = SessionLocal()
     summary: dict = {
@@ -216,12 +292,13 @@ def ingest_all_active_parcels(*, force_refresh: bool = False) -> dict:
         "ok": 0,
         "failed": 0,
         "skipped_cached": 0,
+        "maps_launched": 0,
         "results": [],
     }
 
     try:
         rows = db.execute(
-            text("SELECT id FROM parcel ORDER BY id")
+            text("SELECT id FROM parcel WHERE status = 'active' ORDER BY id")
         ).fetchall()
         parcel_ids = [r.id for r in rows]
         summary["total"] = len(parcel_ids)
@@ -244,6 +321,22 @@ def ingest_all_active_parcels(*, force_refresh: bool = False) -> dict:
                 else:
                     summary["failed"] += 1
 
+                # Aligner l'image de la carte sur la date des indices
+                if res["ok"]:
+                    try:
+                        res["map_sync"] = _sync_map_with_indices(
+                            db, pid, res.get("scene_date")
+                        )
+                        if res["map_sync"] == "launched":
+                            summary["maps_launched"] += 1
+                    except Exception:
+                        db.rollback()
+                        res["map_sync"] = "error"
+                        logger.exception(
+                            "⚠️ [ingestion] Alignement de la carte impossible (parcel_id=%s)",
+                            pid,
+                        )
+
             except Exception as e:
                 logger.exception(
                     "❌ [ingestion] Échec parcel_id=%s : %s", pid, e
@@ -256,8 +349,9 @@ def ingest_all_active_parcels(*, force_refresh: bool = False) -> dict:
                 })
 
         logger.info(
-            "🏁 [ingestion] Batch terminé : %d OK, %d failed, %d cached",
+            "🏁 [ingestion] Batch terminé : %d OK, %d failed, %d cached, %d cartes relancées",
             summary["ok"], summary["failed"], summary["skipped_cached"],
+            summary["maps_launched"],
         )
         return summary
 

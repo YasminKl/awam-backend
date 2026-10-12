@@ -41,24 +41,12 @@ def send_reset_password_email(to_email: str, reset_link: str) -> None:
         raise
 
 
-def send_agenda_reminder_email(
-    to_email: str,
-    event_title: str,
-    event_datetime_str: str,
-    reminder_label: str = "bientôt",
-) -> None:
-    """
-    reminder_label : texte du délai réel choisi par l'utilisateur
-    (ex: "dans 15 minutes", "dans 1 heure", "demain", "dans 1 semaine",
-    "dans 45 minutes" pour un rappel personnalisé). Calculé côté
-    appelant (agenda_tasks.py) à partir de event.reminder /
-    event.reminder_custom_minutes / event.reminder_custom_unit.
-    """
+def send_agenda_reminder_email(to_email: str, event_title: str, event_datetime_str: str) -> None:
     html_content = f"""
     <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
         <h2 style="color: #1a1a1a;">Rappel : {event_title}</h2>
         <p style="color: #333; font-size: 15px; line-height: 1.5;">
-            Vous avez un événement prévu {reminder_label} sur AWAM :
+            Vous avez un événement à venir sur AWAM :
         </p>
         <div style="background-color: #f5f5f0; border-radius: 8px; padding: 16px; margin: 20px 0;">
             <p style="margin: 0; font-weight: bold; color: #1a1a1a;">{event_title}</p>

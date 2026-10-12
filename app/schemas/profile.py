@@ -44,6 +44,12 @@ class UpdateUsernameRequest(BaseModel):
 class UpdateEmailRequest(BaseModel):
     email: EmailStr
 
+    @field_validator("email")
+    @classmethod
+    def email_lowercase(cls, v: str) -> str:
+        # ⬅️ CASSE E-MAIL : les e-mails sont enregistrés et comparés en minuscules
+        return v.lower()
+
 
 class UpdatePasswordRequest(BaseModel):
     current_password: Optional[str] = None

@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File, status
+from sqlalchemy import func  # ⬅️ CASSE E-MAIL
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user, hash_password, verify_password
+from app.api.routes.auth import set_auth_cookie
 from app.db.database import get_db
 from app.models.utilisateur import User
 from app.schemas.profile import (
@@ -71,7 +73,7 @@ async def update_email(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    existing = db.query(User).filter(User.email == payload.email, User.id != user.id).first()
+    existing = db.query(User).filter(func.lower(User.email) == payload.email, User.id != user.id).first()  # ⬅️ CASSE E-MAIL
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -87,6 +89,7 @@ async def update_email(
 @router.put("/password", response_model=ProfileResponse)
 async def update_password(
     payload: UpdatePasswordRequest,
+    response: Response,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -106,6 +109,10 @@ async def update_password(
     user.password_changed_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(user)
+
+    # Nouveau cookie pour l'appareil qui vient de changer le mot de passe :
+    # il reste connecté, les sessions des autres appareils sont invalidées.
+    set_auth_cookie(response, user.id)
     return build_profile_response(user)
 
 

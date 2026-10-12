@@ -18,6 +18,9 @@ class Activity(Base):
     parcel_id = Column(Integer, ForeignKey("parcel.id"), nullable=False, index=True)
 
     activity_type = Column(String(100), nullable=False)
+    crop_id = Column(
+        Integer, ForeignKey("crop.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     performed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     parcel = relationship("Parcel", back_populates="activities")

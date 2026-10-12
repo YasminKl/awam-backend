@@ -44,6 +44,8 @@ async def get_my_parcelles(
                 p.culture_type,
                 p.soil_type,
                 p.irrigation_type,
+                p.status,
+                p.raster_status,
                 p.created_at,
                 p.updated_at
             FROM parcel p
@@ -67,6 +69,8 @@ async def get_my_parcelles(
             "culture_type": row.culture_type,
             "soil_type": row.soil_type,
             "irrigation_type": row.irrigation_type,
+            "status": row.status,
+            "raster_status": row.raster_status,
             "created_at": row.created_at.isoformat() if row.created_at else None,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }

@@ -1,4 +1,5 @@
 from authlib.integrations.starlette_client import OAuth
+from sqlalchemy import func  # ⬅️ CASSE E-MAIL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -44,11 +45,13 @@ def determine_role_for_new_user(db: Session, email: str) -> str:
 
 
 def get_or_create_user(db: Session, google_id: str, email: str, full_name: str) -> User:
+    email = email.strip().lower()  # ⬅️ CASSE E-MAIL : e-mails enregistrés et comparés en minuscules
+
     user = db.query(User).filter(User.google_id == google_id).first()
     if user:
         return user
 
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(func.lower(User.email) == email).first()  # ⬅️ CASSE E-MAIL
     if user:
         user.google_id = google_id
         db.commit()
