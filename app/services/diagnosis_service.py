@@ -200,10 +200,6 @@ def cross_read(indicators: list[Indicator]) -> tuple[str, list[Risk]]:
         ratio = ind.drop_ratio if ind else None
         return ratio is not None and ratio >= threshold
 
-    def rising(name: str) -> bool:
-        ind = by_name.get(name)
-        return ind is not None and ind.delta is not None and ind.delta > 0
-
     def is_low(name: str) -> bool:
         ind = by_name.get(name)
         return ind is not None and ind.level == "low"
@@ -211,24 +207,34 @@ def cross_read(indicators: list[Indicator]) -> tuple[str, list[Risk]]:
     risks: list[Risk] = []
     reading = ""
 
-    # --- Stress hydrique : NDMI qui baisse et MSI qui monte ---------
-    if (is_low("NDMI") or falling("NDMI", SIGNIFICANT_DROP)) and rising("MSI"):
-        reading = "Le NDMI baisse et le MSI monte : stress hydrique probable."
-        risks.append(Risk(
-            severity="alert",
-            diagnosis="Stress hydrique probable",
-            measure="Mesurer l'humidité du sol, le débit et la pression d'irrigation",
-            action="Restaurer une irrigation régulière si le déficit est confirmé",
-        ))
+    # --- Signal hydrique : NDMI bas ou en baisse --------------------
+    # Le MSI n'est PAS une confirmation indépendante : il se déduit du
+    # NDMI, MSI = (1 - NDMI) / (1 + NDMI), et monte mécaniquement dès que
+    # le NDMI baisse. Il n'y a donc qu'un seul signal, qui vaut « à
+    # surveiller » ; c'est sa répétition sur deux images (règle de
+    # confirmation, voir compute_severity) qui le fait passer en alerte.
+    water_signal = is_low("NDMI") or falling("NDMI", SIGNIFICANT_DROP)
 
-    # --- Stress hydrique précoce : NDMI seul, couvert encore stable --
-    elif (is_low("NDMI") or falling("NDMI", SIGNIFICANT_DROP)) and not falling("NDVI"):
-        reading = "Le NDMI baisse alors que le couvert reste stable : stress hydrique précoce."
+    if water_signal and not falling("NDVI"):
+        # On n'affirme que le couvert est stable que si le NDVI est suivi à ce stade
+        reading = (
+            "Le NDMI est bas ou en baisse alors que le couvert reste stable : stress hydrique précoce."
+            if "NDVI" in by_name
+            else "Le NDMI est bas ou en baisse : stress hydrique précoce."
+        )
         risks.append(Risk(
             severity="watch",
             diagnosis="Stress hydrique précoce",
             measure="Contrôler l'humidité du sol avant perte de couvert",
             action="Ajuster l'irrigation progressivement, sans excès",
+        ))
+    elif water_signal:
+        reading = "Le NDMI est bas ou en baisse et le couvert recule : stress hydrique possible."
+        risks.append(Risk(
+            severity="watch",
+            diagnosis="Stress hydrique possible",
+            measure="Mesurer l'humidité du sol, le débit et la pression d'irrigation",
+            action="Restaurer une irrigation régulière si le déficit est confirmé",
         ))
 
     # --- Problème nutritionnel : NDRE baisse, NDMI stable -----------
@@ -252,7 +258,8 @@ def cross_read(indicators: list[Indicator]) -> tuple[str, list[Risk]]:
         ))
 
     # --- Couvert qui recule, hydratation normale --------------------
-    elif falling("NDVI", SIGNIFICANT_DROP) and not falling("NDMI"):
+    # « Hydratation normale » : NDMI ni bas ni en baisse.
+    elif falling("NDVI", SIGNIFICANT_DROP) and not water_signal:
         reading = reading or "Le couvert recule alors que l'hydratation reste normale : cause non hydrique."
         risks.append(Risk(
             severity="watch",
