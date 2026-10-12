@@ -350,7 +350,7 @@ def diagnose(
     Returns:
         Diagnosis prêt à afficher ou à archiver.
     """
-    period = get_stage_at(species, scene_date)
+    period = get_stage_at(species, scene_date, planting_date)
     stage = period.stage if period else None
     spec = get_species(species)
     age = compute_age_years(planting_date, scene_date)
@@ -361,6 +361,12 @@ def diagnose(
         stage_period=period.label if period else "",
         age_years=round(age, 1) if age is not None else None,
     )
+
+    # Image antérieure à la plantation : elle ne concerne pas cette culture
+    if planting_date is not None and scene_date < planting_date:
+        result.stage_label = "Pas encore plantée"
+        result.reading = "Image antérieure à la date de plantation : pas de diagnostic."
+        return result
 
     if not spec or not stage:
         result.reading = "Espèce non référencée : aucune interprétation possible."
@@ -376,7 +382,7 @@ def diagnose(
     result.age_required = age is None and has_age_specific_rules(species, stage)
 
     # Une baisse pendant une coupe ou une récolte n'est pas une anomalie
-    result.cultural_drop = recent_harvest or is_cultural_period(species, scene_date)
+    result.cultural_drop = recent_harvest or is_cultural_period(species, scene_date, planting_date)
     if result.cultural_drop:
         result.reading = (
             "Période de coupe ou de récolte : les baisses de couvert sont "

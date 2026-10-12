@@ -352,7 +352,7 @@ def create_observation(
     crop = _get_owned_crop(crop_id, user, db)
 
     observed_at = payload.observed_at or datetime.now(timezone.utc)
-    period = get_stage_at(crop.species, observed_at.date())
+    period = get_stage_at(crop.species, observed_at.date(), crop.planting_date)
 
     observation = CropObservation(
         crop_id=crop_id,

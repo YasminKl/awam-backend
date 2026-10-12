@@ -130,7 +130,7 @@ def get_crop_stages(
     crop = _get_owned_crop(crop_id, user, db)
 
     today = date.today()
-    current = get_stage_at(crop.species, today)
+    current = get_stage_at(crop.species, today, crop.planting_date)
     current_stage = current.stage if current else None
 
     return [
@@ -141,7 +141,7 @@ def get_crop_stages(
             is_current=(p.stage == current_stage),
             cultural_drop=p.cultural_drop,
         )
-        for p in get_periods(crop.species)
+        for p in get_periods(crop.species, crop.planting_date)
     ]
 
 
@@ -173,7 +173,7 @@ async def get_crop_needs(
         {"pid": crop.parcel_id},
     ).fetchone()
 
-    period = get_stage_at(crop.species, date.today())
+    period = get_stage_at(crop.species, date.today(), crop.planting_date)
     stage = period.stage if period else ""
 
     # --- Irrigation ---------------------------------------------------

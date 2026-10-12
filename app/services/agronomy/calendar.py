@@ -14,12 +14,29 @@ le stade retenu est le dernier déclaré qui couvre la date, les stades
 
 Une période peut passer d'une année sur l'autre (novembre → février) :
 `start_month` est alors supérieur à `end_month`.
+
+DATE DE PLANTATION — elle est prise en compte de deux façons :
+  - Avant la date de plantation, la culture n'a pas de stade : une image
+    satellite antérieure ne la concerne pas.
+  - Culture ANNUELLE (basilic) : le calendrier décrit un cycle qui part
+    du semis. Quand la date de semis est connue, ce cycle est DÉCALÉ pour
+    commencer au mois du semis, en gardant la durée de chaque stade donnée
+    par le document. Un basilic semé en septembre est donc en croissance
+    en octobre, et non en « fin de cycle » comme un basilic semé en mars.
+    Au-delà de la fin du cycle, la culture reste en fin de cycle.
+    Limite : les durées du document correspondent à un semis de printemps ;
+    hors saison, la croissance réelle peut être plus lente.
+  - Culture PÉRENNE (arbres, aromatiques vivaces) : le stade suit les
+    saisons, le calendrier s'applique tel quel quelle que soit l'année de
+    plantation ; l'âge agit sur les seuils, pas sur le stade.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+
+from app.services.agronomy.species import CropType, get_species
 
 
 @dataclass(frozen=True)
@@ -164,32 +181,82 @@ PHENOLOGY: dict[str, tuple[StagePeriod, ...]] = {
 }
 
 
-def get_stage_at(species: str, when: date) -> StagePeriod | None:
+#: Stade qui clôt le cycle d'une culture annuelle
+END_OF_CYCLE_STAGE = "fin_cycle"
+
+
+def _is_annual(species: str) -> bool:
+    spec = get_species(species)
+    return spec is not None and spec.crop_type == CropType.ANNUAL
+
+
+def _shift(period: StagePeriod, months: int) -> StagePeriod:
+    """La même période, décalée de `months` mois (avec passage d'année)."""
+    wrap = lambda m: (m - 1 + months) % 12 + 1
+    return StagePeriod(period.stage, wrap(period.start_month), wrap(period.end_month), period.cultural_drop)
+
+
+def _months_between(start: date, end: date) -> int:
+    """Nombre de mois calendaires de `start` à `end` (0 = même mois)."""
+    return (end.year - start.year) * 12 + end.month - start.month
+
+
+def get_periods(species: str, planting_date: date | None = None) -> tuple[StagePeriod, ...]:
+    """
+    Toutes les périodes d'une espèce, dans l'ordre du cycle.
+
+    Culture annuelle avec date de semis : le cycle est décalé pour
+    commencer au mois du semis (voir l'en-tête du module).
+    """
+    periods = PHENOLOGY.get(species.lower(), ())
+    if not periods or planting_date is None or not _is_annual(species):
+        return periods
+    offset = planting_date.month - periods[0].start_month
+    return tuple(_shift(p, offset) for p in periods)
+
+
+def get_stage_at(
+    species: str, when: date, planting_date: date | None = None
+) -> StagePeriod | None:
     """
     Stade de l'espèce à une date donnée.
 
     Les périodes se chevauchant, on retient le dernier stade déclaré qui
     couvre le mois : les stades étant listés dans l'ordre du cycle, c'est
     le plus avancé (ex. en juillet pour la lavande : récolte, pas floraison).
+
+    Avec la date de plantation : aucun stade avant elle, et pour une
+    culture annuelle, cycle décalé au mois du semis.
     """
-    periods = PHENOLOGY.get(species.lower())
+    if planting_date is not None and when < planting_date:
+        return None   # pas encore plantée à cette date
+
+    periods = get_periods(species, planting_date)
     if not periods:
         return None
+
+    if planting_date is not None and _is_annual(species):
+        end = next((p for p in periods if p.stage == END_OF_CYCLE_STAGE), None)
+        if end is not None:
+            # Durée du cycle, en mois, du début du semis à la fin de cycle
+            cycle_months = (end.end_month - periods[0].start_month) % 12
+            if _months_between(planting_date, when) > cycle_months:
+                return end   # cycle terminé : la culture reste en fin de cycle
+
     matching = [p for p in periods if p.covers(when.month)]
     return matching[-1] if matching else None
 
 
-def get_periods(species: str) -> tuple[StagePeriod, ...]:
-    """Toutes les périodes d'une espèce, dans l'ordre du cycle."""
-    return PHENOLOGY.get(species.lower(), ())
-
-
-def is_cultural_period(species: str, when: date) -> bool:
+def is_cultural_period(
+    species: str, when: date, planting_date: date | None = None
+) -> bool:
     """
     Vrai si une baisse d'indice est attendue à cette date (coupe, récolte,
     taille). Sert à neutraliser les fausses alertes.
     """
-    periods = PHENOLOGY.get(species.lower())
+    if planting_date is not None and when < planting_date:
+        return False
+    periods = get_periods(species, planting_date)
     if not periods:
         return False
     return any(p.covers(when.month) and p.cultural_drop for p in periods)
@@ -200,9 +267,9 @@ def is_cultural_period(species: str, when: date) -> bool:
 HARVEST_STAGES = ("recolte", "recoltes")
 
 
-def first_harvest_period(species: str) -> StagePeriod | None:
-    """Première période de récolte de l'espèce dans l'année."""
-    for period in get_periods(species):
+def first_harvest_period(species: str, planting_date: date | None = None) -> StagePeriod | None:
+    """Première période de récolte de l'espèce dans le cycle."""
+    for period in get_periods(species, planting_date):
         if period.stage in HARVEST_STAGES:
             return period
     return None
@@ -228,7 +295,7 @@ def expected_harvest_date(
     La date renvoyée n'est jamais dans le passé : pour un verger planté
     depuis longtemps, c'est la prochaine période de récolte.
     """
-    period = first_harvest_period(species)
+    period = first_harvest_period(species, planting_date)
     if period is None:
         return None
     if orchard and not in_production:

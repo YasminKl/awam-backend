@@ -117,7 +117,7 @@ def _recompute_diagnoses(db, parcel_id: int | None, apply: bool) -> int:
         query = query.filter(Crop.parcel_id == parcel_id)
     crops = query.order_by(Crop.parcel_id, Crop.id).all()
 
-    counts = {"inchangé": 0, "moins grave": 0, "plus grave": 0, "nouveau": 0}
+    counts = {"inchangé": 0, "moins grave": 0, "plus grave": 0, "nouveau": 0, "retiré": 0}
     written = 0
 
     for crop in crops:
@@ -143,12 +143,21 @@ def _recompute_diagnoses(db, parcel_id: int | None, apply: bool) -> int:
                 valid_ratio=current.valid_ratio,
             )
 
-            # Comme l'archive : seuls les diagnostics avec indicateurs comptent
+            old = archived.get(day)
+
+            # Comme l'archive : seuls les diagnostics avec indicateurs comptent.
+            # Un ancien diagnostic qui n'a plus lieu d'être (image antérieure
+            # à la plantation, par exemple) est retiré de l'archive.
             if not result.indicators:
+                if old is not None:
+                    counts["retiré"] += 1
+                    print(f" − {day}  {_severity_label(old.severity):>16} → retiré           {result.reading}")
+                    if apply:
+                        db.delete(old)
+                        db.commit()
                 continue
             chain_severity = result.severity
 
-            old = archived.get(day)
             old_severity = old.severity if old else None
             if old_severity is None:
                 status = "nouveau"
@@ -173,7 +182,7 @@ def _recompute_diagnoses(db, parcel_id: int | None, apply: bool) -> int:
     print(
         f"\nBilan : {counts['moins grave']} moins grave(s), "
         f"{counts['plus grave']} plus grave(s), {counts['inchangé']} inchangé(s), "
-        f"{counts['nouveau']} nouveau(x)."
+        f"{counts['nouveau']} nouveau(x), {counts['retiré']} retiré(s)."
     )
     if apply:
         print(f"Archive réécrite : {written} diagnostic(s).")
