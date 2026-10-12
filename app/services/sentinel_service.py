@@ -31,12 +31,14 @@ import logging
 import tempfile
 import warnings
 from datetime import datetime, timedelta
+import json
 
 # ----------------------------------------------------------------------
 # Imports tiers
 # ----------------------------------------------------------------------
 import numpy as np
 import rasterio
+from rasterio.enums import ColorInterp
 import rioxarray
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
@@ -73,22 +75,16 @@ from app.services.zonal_stats import (
 # ----------------------------------------------------------------------
 # Configuration logging & warnings
 # ----------------------------------------------------------------------
-# ✅ Réduire le bruit des warnings GDAL (rio-cogeo émet des CPLE_NotSupported
-# pour les options COG passées au driver GTiff — c'est inoffensif).
 logging.getLogger("rasterio._env").setLevel(logging.ERROR)
 
-# ✅ Masquer les warnings STAC non bloquants (Planetary Computer ne supporte
-# pas certains paramètres de `query` mais le filtre fonctionne côté serveur).
 warnings.filterwarnings("ignore", message=".*DoesNotConformTo.*")
 warnings.filterwarnings("ignore", message=".*CPLE_NotSupported.*")
 warnings.filterwarnings("ignore", message=".*PREDICTOR option is ignored.*")
 
-# ✅ Désactiver TOUS les loggers pystac
 logging.getLogger("pystac").setLevel(logging.ERROR)
 logging.getLogger("pystac_client").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 
-# ✅ Désactiver TOUS les warnings (dernier recours)
 warnings.simplefilter("ignore")
 
 logger = logging.getLogger(__name__)
@@ -106,13 +102,31 @@ BAND_NIR = "B08"
 BAND_SCL = "SCL"
 
 S2_REFLECTANCE_SCALE = 10000.0
-DEFAULT_LOOKBACK_DAYS = 90
-MAX_CLOUD_COVER = 20  # %
 
-# ✅ Résolution cible après upsampling (en mètres, dans le CRS natif de la bande)
-# 5.0 = upsampling 2x par rapport au 10m natif de Sentinel-2
-# 2.5 = upsampling 4x (rendu encore plus lisse)
-# None = pas d'upsampling (reste en 10m natif, fichiers plus petits)
+# Depuis la version de traitement 04.00 (25 janvier 2022), l'ESA ajoute
+# 1000 aux valeurs L2A : réflectance = (valeur - 1000) / 10 000.
+# Les scènes plus anciennes : réflectance = valeur / 10 000.
+S2_BOA_ADD_OFFSET = -1000.0
+S2_OFFSET_FROM_BASELINE = 4.0
+S2_OFFSET_FROM_DATE = "2022-01-25"
+
+DEFAULT_LOOKBACK_DAYS = 90
+
+# Plafond de nuages à la RECHERCHE. Volontairement large : le tri fin se
+# fait ensuite sur la parcelle elle-même, via la bande SCL. Une scène à
+# 50 % de nuages peut être parfaite si les nuages sont ailleurs.
+MAX_CLOUD_COVER = 60  # %
+
+# Part minimale de la PARCELLE réellement observée (pixels non nuageux)
+# pour qu'une scène soit retenue. En dessous, on cherche une scène plus
+# ancienne : une moyenne calculée sur un coin de parcelle n'est pas
+# représentative.
+MIN_VALID_RATIO = 0.60
+
+# Nombre de scènes testées avant d'abandonner (chaque test = 1 lecture SCL)
+MAX_SCENES_TO_TEST = 6
+
+# Résolution cible après upsampling (en mètres, dans le CRS natif)
 TARGET_RESOLUTION_M = 5.0
 
 # Valeurs SCL considérées comme "à masquer" (nuages, ombres, neige, saturés)
@@ -128,15 +142,8 @@ SCL_MASK_VALUES = {
 
 
 # ======================================================================
-# ======================================================================
 # PIPELINE HISTORIQUE — RGB + NDVI
 # ======================================================================
-# ======================================================================
-
-
-# ----------------------------------------------------------------------
-# Helpers PostGIS
-# ----------------------------------------------------------------------
 
 
 def _get_bbox_for_parcel(
@@ -158,17 +165,130 @@ def _get_bbox_for_parcel(
     return (row.west, row.south, row.east, row.north)
 
 
+def _get_geometry_for_parcel(db: Session, parcel_id: int) -> dict | None:
+    """Polygone de la parcelle en GeoJSON (EPSG:4326), ou None."""
+    row = db.execute(
+        text("SELECT ST_AsGeoJSON(geom) AS geojson FROM parcel WHERE id = :parcel_id"),
+        {"parcel_id": parcel_id},
+    ).fetchone()
+    if not row or not row.geojson:
+        return None
+    return json.loads(row.geojson)
+
+
+def _build_parcel_mask(geometry: dict, transform, crs, shape: tuple[int, int]):
+    """
+    Masque booléen aux dimensions de l'image : True HORS de la parcelle.
+
+    Les bandes sont découpées sur la bbox (un rectangle) ; ce masque sert à
+    rendre transparent tout ce qui dépasse le polygone réel, pour que l'image
+    affichée épouse exactement les limites de la parcelle.
+    """
+    from rasterio.features import geometry_mask
+    from rasterio.warp import transform_geom
+
+    geom = transform_geom("EPSG:4326", crs.to_string(), geometry)
+    return geometry_mask(
+        [geom],
+        out_shape=shape,
+        transform=transform,
+        invert=False,      # True = pixel HORS du polygone
+        all_touched=True,  # garde les pixels de bordure
+    )
+
+
+def _boa_offset(item) -> float:
+    """
+    Décalage à appliquer aux valeurs brutes de la scène, selon sa version
+    de traitement (propriété `s2:processing_baseline`). Si la version est
+    absente ou illisible, on se fie à la date de la scène.
+    """
+    baseline = item.properties.get("s2:processing_baseline")
+    try:
+        recent = float(baseline) >= S2_OFFSET_FROM_BASELINE
+    except (TypeError, ValueError):
+        scene_day = str(item.properties.get("datetime", ""))[:10]
+        recent = scene_day >= S2_OFFSET_FROM_DATE
+        logger.warning(
+            "[Sentinel] Version de traitement illisible (%r) pour %s : "
+            "décalage déduit de la date (%s)", baseline, item.id, scene_day,
+        )
+    return S2_BOA_ADD_OFFSET if recent else 0.0
+
+
+def _to_reflectance(arr: np.ndarray, offset: float) -> np.ndarray:
+    """
+    Valeurs brutes Sentinel-2 L2A → réflectance de surface (0 à 1).
+
+    Les valeurs légèrement négatives, produites par la correction
+    atmosphérique sur des surfaces très sombres, sont ramenées à 0.
+    Les NaN (pas de donnée, nuages) restent NaN.
+    """
+    reflectance = (arr.astype("float32") + offset) / S2_REFLECTANCE_SCALE
+    return np.maximum(reflectance, 0.0).astype("float32")
+
+
+def _clip_band_to_bbox(
+    item,
+    band: str,
+    bbox: tuple[float, float, float, float],
+    target_resolution: float | None = TARGET_RESOLUTION_M,
+):
+    """
+    Ouvre une bande (COG distant), la découpe sur la bbox,
+    et applique un upsampling si target_resolution est défini.
+    """
+    asset = item.assets[band]
+    da = rioxarray.open_rasterio(asset.href, masked=True)
+
+    left, bottom, right, top = transform_bounds(
+        "EPSG:4326", da.rio.crs, *bbox, densify_pts=21
+    )
+
+    clipped = da.rio.clip_box(
+        minx=left, miny=bottom, maxx=right, maxy=top, crs=da.rio.crs
+    )
+
+    if target_resolution is not None:
+        try:
+            upsampled = clipped.rio.reproject(
+                clipped.rio.crs,
+                resolution=target_resolution,
+                resampling=Resampling.bilinear,
+            )
+            logger.info(
+                "[Sentinel] %s : upsampling %s → %s (%.1fm)",
+                band, clipped.shape[1:], upsampled.shape[1:], target_resolution,
+            )
+            return upsampled
+        except Exception as e:
+            logger.warning(
+                "[Sentinel] Échec upsampling %s, utilisation native : %s", band, e
+            )
+            return clipped
+
+    return clipped
+
+
 # ----------------------------------------------------------------------
-# Recherche STAC
+# Recherche et sélection de scène
 # ----------------------------------------------------------------------
 
 
-def _search_best_scene(
+def _search_scene_candidates(
     bbox: tuple[float, float, float, float],
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     max_cloud: int = MAX_CLOUD_COVER,
-):
-    """Cherche la scène Sentinel-2 L2A la moins nuageuse et la plus récente."""
+    limit: int = MAX_SCENES_TO_TEST,
+) -> list:
+    """
+    Scènes candidates, de la PLUS RÉCENTE à la plus ancienne.
+
+    Le tri privilégie la fraîcheur : pour du suivi agricole, une image
+    récente partiellement nuageuse est plus utile qu'une image parfaite
+    d'il y a six semaines. La qualité réelle est jugée ensuite, sur la
+    parcelle, par `_select_usable_scene`.
+    """
     end = datetime.utcnow()
     start = end - timedelta(days=lookback_days)
 
@@ -180,8 +300,8 @@ def _search_best_scene(
         query={"eo:cloud_cover": {"lt": max_cloud}},
         limit=50,
     )
-
     items = list(search.items())
+
     if not items:
         logger.warning(
             "[Sentinel] Aucune scène < %d%% nuages, recherche élargie", max_cloud
@@ -195,88 +315,130 @@ def _search_best_scene(
         items = list(search.items())
 
     if not items:
-        return None
+        return []
 
-    def sort_key(it):
-        cloud = it.properties.get("eo:cloud_cover", 100)
-        dt_str = it.properties.get("datetime", "")
+    def scene_datetime(it) -> float:
         try:
-            dt_ts = -datetime.fromisoformat(
-                dt_str.replace("Z", "+00:00")
+            return datetime.fromisoformat(
+                it.properties.get("datetime", "").replace("Z", "+00:00")
             ).timestamp()
         except Exception:
-            dt_ts = 0
-        return (cloud, dt_ts)
+            return 0.0
 
-    items.sort(key=sort_key)
-    best = items[0]
-
-    # Signature SAS obligatoire, sinon GDAL reçoit 409 sur les COG Sentinel-2
-    best = planetary_computer.sign(best)
-    return best
+    items.sort(key=scene_datetime, reverse=True)
+    return [planetary_computer.sign(it) for it in items[:limit]]
 
 
-# ----------------------------------------------------------------------
-# Lecture des bandes (avec upsampling)
-# ----------------------------------------------------------------------
-
-
-def _clip_band_to_bbox(
+def _parcel_valid_ratio(
     item,
-    band: str,
     bbox: tuple[float, float, float, float],
-    target_resolution: float | None = TARGET_RESOLUTION_M,
-):
+    geometry: dict | None,
+) -> float:
     """
-    Ouvre une bande (COG distant), la découpe sur la bbox,
-    et applique un upsampling si target_resolution est défini.
+    Part de la PARCELLE réellement observée sur cette scène.
 
-    Args:
-        item: STAC Item signé
-        band: nom de la bande (ex: 'B04')
-        bbox: (west, south, east, north) en EPSG:4326
-        target_resolution: résolution cible en mètres (None = natif 10m)
+    Seule la bande SCL est téléchargée : elle est légère et suffit à
+    savoir où sont les nuages. On la découpe sur le polygone, puis on
+    compte les pixels exploitables (ni nuage, ni ombre, ni neige).
 
     Returns:
-        DataArray avec la bande découpée et potentiellement upsamplée
+        Ratio entre 0 et 1. 1.0 si la SCL est indisponible (on ne peut
+        pas conclure, on ne pénalise pas la scène).
     """
-    asset = item.assets[band]
-    da = rioxarray.open_rasterio(asset.href, masked=True)
+    try:
+        scl_da = _clip_band_to_bbox(item, BAND_SCL, bbox, target_resolution=None)
+        scl = scl_da.values[0]
+    except Exception as e:
+        logger.warning("[Sentinel] SCL illisible, scène non évaluée : %s", e)
+        return 1.0
 
-    left, bottom, right, top = transform_bounds(
-        "EPSG:4326", da.rio.crs, *bbox, densify_pts=21
-    )
-
-    clipped = da.rio.clip_box(
-        minx=left, miny=bottom, maxx=right, maxy=top, crs=da.rio.crs
-    )
-
-    # ✅ Upsampling si demandé
-    if target_resolution is not None:
+    inside = None
+    if geometry is not None:
         try:
-            upsampled = clipped.rio.reproject(
-                clipped.rio.crs,
-                resolution=target_resolution,
-                resampling=Resampling.bilinear,
+            outside = _build_parcel_mask(
+                geometry, scl_da.rio.transform(), scl_da.rio.crs, scl.shape
             )
-            logger.info(
-                "[Sentinel] %s : upsampling %s → %s (%.1fm)",
-                band,
-                clipped.shape[1:],
-                upsampled.shape[1:],
-                target_resolution,
-            )
-            return upsampled
+            inside = ~outside
         except Exception as e:
-            logger.warning(
-                "[Sentinel] Échec upsampling %s, utilisation native : %s",
-                band,
-                e,
+            logger.warning("[Sentinel] Masque parcelle impossible pour la SCL : %s", e)
+
+    if inside is None:
+        inside = np.ones(scl.shape, dtype=bool)
+
+    total = int(inside.sum())
+    if total == 0:
+        return 1.0
+
+    cloudy = np.isin(scl, list(SCL_MASK_VALUES)) & inside
+    return float((total - int(cloudy.sum())) / total)
+
+
+def _select_usable_scene(
+    db: Session,
+    parcel_id: int,
+    bbox: tuple[float, float, float, float],
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> tuple[object | None, float]:
+    """
+    Choisit la scène la plus récente dont la parcelle est suffisamment
+    dégagée.
+
+    On ne juge pas sur le taux de nuages de la scène entière (110 km de
+    côté), mais sur la part de LA PARCELLE réellement visible : une scène
+    à 50 % de nuages est parfaite si les nuages sont ailleurs.
+
+    Returns:
+        (scène retenue ou None, part de parcelle observée)
+    """
+    candidates = _search_scene_candidates(bbox, lookback_days=lookback_days)
+    if not candidates:
+        return None, 0.0
+
+    geometry = _get_geometry_for_parcel(db, parcel_id)
+    best_item, best_ratio = None, -1.0
+
+    for item in candidates:
+        scene_date = item.properties.get("datetime", "")[:10]
+        ratio = _parcel_valid_ratio(item, bbox, geometry)
+
+        logger.info(
+            "[Sentinel] Scène %s : %.0f%% de la parcelle exploitable",
+            scene_date, ratio * 100,
+        )
+
+        if ratio >= MIN_VALID_RATIO:
+            logger.info(
+                "[Sentinel] Scène retenue : %s (la plus récente exploitable)", scene_date
             )
-            return clipped
+            return item, ratio
 
-    return clipped
+        if ratio > best_ratio:
+            best_item, best_ratio = item, ratio
 
+    if best_item is not None:
+        logger.warning(
+            "[Sentinel] Aucune scène ≥ %.0f%% : repli sur %s (%.0f%% exploitable)",
+            MIN_VALID_RATIO * 100,
+            best_item.properties.get("datetime", "")[:10],
+            best_ratio * 100,
+        )
+    return best_item, max(best_ratio, 0.0)
+
+
+def _search_best_scene(
+    bbox: tuple[float, float, float, float],
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_cloud: int = MAX_CLOUD_COVER,
+):
+    """
+    Compatibilité : renvoie la scène la plus récente sous le plafond de
+    nuages, sans évaluation sur la parcelle (pas de session DB ici).
+    Préférer `_select_usable_scene` quand la parcelle est connue.
+    """
+    candidates = _search_scene_candidates(bbox, lookback_days, max_cloud, limit=1)
+    return candidates[0] if candidates else None
+
+    
 
 # ----------------------------------------------------------------------
 # Traitement
@@ -298,9 +460,7 @@ def _mask_clouds_with_scl(
     if masked_count > 0:
         logger.info(
             "[Sentinel] Masque SCL : %d/%d pixels masqués (%.1f%%)",
-            masked_count,
-            total,
-            100.0 * masked_count / total,
+            masked_count, total, 100.0 * masked_count / total,
         )
     else:
         logger.info("[Sentinel] Masque SCL : aucun pixel à masquer")
@@ -314,11 +474,10 @@ def _mask_clouds_with_scl(
 
 def _reflectance_to_uint8(arr: np.ndarray, gamma: float = 0.9) -> np.ndarray:
     """
-    Convertit une réflectance Sentinel-2 (0..10000) en uint8 (0..255).
+    Convertit une réflectance Sentinel-2 en uint8 (0..255).
 
-    - Étirement 1-99% (plus agressif que 2-98%)
-    - Gamma correction (gamma < 1 éclaircit)
-    - Gestion des NaN
+    L'étirement entre les centiles 1 et 99 rend le résultat indépendant
+    de l'échelle des valeurs reçues.
     """
     valid = arr[np.isfinite(arr) & (arr > 0)]
     if valid.size == 0:
@@ -339,14 +498,7 @@ def _reflectance_to_uint8(arr: np.ndarray, gamma: float = 0.9) -> np.ndarray:
 
 
 def _compute_blocksize(height: int, width: int) -> int:
-    """
-    Calcule une taille de bloc adaptée à la taille du raster.
-
-    Doit être :
-      - Multiple de 16
-      - Ne pas dépasser la taille du raster
-      - Idéalement 512 pour les grands rasters, 256 pour les moyens
-    """
+    """Taille de bloc adaptée au raster : multiple de 16, sans le dépasser."""
     blocksize = 512
     if width < blocksize or height < blocksize:
         blocksize = 256
@@ -357,17 +509,17 @@ def _compute_blocksize(height: int, width: int) -> int:
 
 
 # ----------------------------------------------------------------------
-# Écriture COG (pipeline historique)
+# Écriture COG
 # ----------------------------------------------------------------------
 
 
-def _write_rgb_cog(red, green, blue, transform, crs, dst_path: str) -> None:
+def _write_rgb_cog(red, green, blue, transform, crs, dst_path: str, alpha=None) -> None:
     """
     Écrit un COG RGB (3 bandes uint8) avec compression optimisée.
 
-    IMPORTANT : les options COG (BLOCKSIZE, LEVEL, PREDICTOR, OVERVIEW_RESAMPLING)
-    ne doivent être passées QU'À cog_translate, PAS à rasterio.open().
-    Sinon GDAL affiche des warnings "CPLE_NotSupported".
+    `alpha` : bande de transparence optionnelle (uint8, 0 = transparent).
+    Fournie quand l'image est découpée sur le polygone de la parcelle, pour
+    que les pixels hors parcelle n'apparaissent pas.
     """
     from rio_cogeo.cogeo import cog_translate
     from rio_cogeo.profiles import cog_profiles
@@ -375,13 +527,13 @@ def _write_rgb_cog(red, green, blue, transform, crs, dst_path: str) -> None:
     tmp_tif = dst_path.replace(".tif", "_tmp.tif")
     height, width = red.shape
     blocksize = _compute_blocksize(height, width)
+    band_count = 4 if alpha is not None else 3
 
-    # Profil GTiff intermédiaire : SEULEMENT les options GTiff natives
     profile = {
         "driver": "GTiff",
         "height": height,
         "width": width,
-        "count": 3,
+        "count": band_count,
         "dtype": "uint8",
         "crs": crs,
         "transform": transform,
@@ -396,8 +548,12 @@ def _write_rgb_cog(red, green, blue, transform, crs, dst_path: str) -> None:
         dst.write(red, 1)
         dst.write(green, 2)
         dst.write(blue, 3)
+        if alpha is not None:
+            dst.write(alpha, 4)
+            dst.colorinterp = [
+                ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha,
+            ]
 
-    # Profil COG : options valides pour cog_translate
     cog_profile = cog_profiles.get("deflate")
     cog_profile.update({
         "BIGTIFF": "IF_SAFER",
@@ -415,11 +571,7 @@ def _write_rgb_cog(red, green, blue, transform, crs, dst_path: str) -> None:
 def _write_single_band_cog(
     arr, transform, crs, dst_path: str, dtype: str = "float32"
 ) -> None:
-    """
-    Écrit un COG mono-bande avec compression optimisée.
-
-    IMPORTANT : les options COG ne doivent être passées QU'À cog_translate.
-    """
+    """Écrit un COG mono-bande avec compression optimisée."""
     from rio_cogeo.cogeo import cog_translate
     from rio_cogeo.profiles import cog_profiles
 
@@ -430,7 +582,6 @@ def _write_single_band_cog(
     nodata_value = -9999.0
     arr_clean = np.where(np.isfinite(arr), arr, nodata_value).astype(dtype)
 
-    # Profil GTiff intermédiaire
     profile = {
         "driver": "GTiff",
         "height": height,
@@ -474,24 +625,9 @@ def generate_sentinel_composites_for_parcel(
     target_resolution: float | None = TARGET_RESOLUTION_M,
 ) -> dict | None:
     """
-    Cherche la meilleure scène Sentinel-2 L2A récente pour l'emprise
-    d'UNE parcelle, génère un composite RGB (COG) et un NDVI (COG),
-    et les uploade sur B2.
-
-    Args:
-        target_resolution: Résolution cible en mètres (5.0 par défaut).
-                          None = résolution native (10 m).
-
-    Retourne :
-      {
-        "rgb_url": ..., "rgb_key": ...,
-        "ndvi_url": ..., "ndvi_key": ...,
-        "scene_date": "2024-07-15",
-        "cloud_cover": 3.2,
-        "scene_id": "S2B_MSIL2A_...",
-        "bbox": [w, s, e, n],
-      }
-    ou None si aucune scène / aucune géométrie.
+    Cherche la scène Sentinel-2 L2A la plus récente exploitable pour UNE
+    parcelle, génère un composite RGB (COG) et un NDVI (COG), découpés sur
+    le polygone, et les uploade sur B2.
     """
     bbox = _get_bbox_for_parcel(db, parcel_id)
     if bbox is None:
@@ -500,16 +636,12 @@ def generate_sentinel_composites_for_parcel(
 
     logger.info("[Sentinel] Bbox parcelle %s : %s", parcel_id, bbox)
 
-    item = _search_best_scene(bbox, lookback_days=lookback_days)
+    # La scène est choisie sur la part de PARCELLE visible, pas sur le
+    # taux de nuages de la scène entière.
+    item, valid_ratio = _select_usable_scene(db, parcel_id, bbox, lookback_days)
     if item is None:
         logger.info("[Sentinel] Aucune scène trouvée pour parcelle %s", parcel_id)
         return None
-
-    logger.info(
-        "[Sentinel] Scène retenue : %s (clouds=%.1f%%)",
-        item.id,
-        item.properties.get("eo:cloud_cover", -1),
-    )
 
     # ------------------------------------------------------------------
     # 1. Charger les 4 bandes + SCL (avec upsampling)
@@ -528,17 +660,21 @@ def generate_sentinel_composites_for_parcel(
     except Exception as e:
         logger.warning("[Sentinel] SCL indisponible, pas de masque nuages : %s", e)
 
-    # Réaligner les bandes sur la même grille que Red
     green_da = green_da.rio.reproject_match(red_da, resampling=Resampling.bilinear)
     blue_da = blue_da.rio.reproject_match(red_da, resampling=Resampling.bilinear)
     nir_da = nir_da.rio.reproject_match(red_da, resampling=Resampling.bilinear)
 
-    red = red_da.values[0].astype("float32")
-    green = green_da.values[0].astype("float32")
-    blue = blue_da.values[0].astype("float32")
-    nir = nir_da.values[0].astype("float32")
+    # Valeurs brutes → réflectance (0 à 1), selon la version de traitement
+    offset = _boa_offset(item)
+    red = _to_reflectance(red_da.values[0], offset)
+    green = _to_reflectance(green_da.values[0], offset)
+    blue = _to_reflectance(blue_da.values[0], offset)
+    nir = _to_reflectance(nir_da.values[0], offset)
 
-    logger.info("[Sentinel] Dimensions finales : %s", red.shape)
+    logger.info(
+        "[Sentinel] Dimensions finales : %s (décalage appliqué : %s)",
+        red.shape, offset,
+    )
 
     transform = red_da.rio.transform()
     crs = red_da.rio.crs
@@ -571,6 +707,25 @@ def generate_sentinel_composites_for_parcel(
         ndvi = np.where(denom == 0, np.nan, (nir - red) / denom).astype("float32")
 
     # ------------------------------------------------------------------
+    # 4 bis. Découper sur le polygone réel de la parcelle
+    # ------------------------------------------------------------------
+    geometry = _get_geometry_for_parcel(db, parcel_id)
+    if geometry is not None:
+        try:
+            outside = _build_parcel_mask(geometry, transform, crs, red.shape)
+            rgb_alpha = np.where(outside, 0, 255).astype("uint8")
+            ndvi = np.where(outside, np.nan, ndvi).astype("float32")
+            logger.info(
+                "[Sentinel] Découpe sur le polygone : %d pixels hors parcelle masqués",
+                int(outside.sum()),
+            )
+        except Exception as e:
+            logger.warning("[Sentinel] Découpe sur le polygone impossible : %s", e)
+            rgb_alpha = None
+    else:
+        rgb_alpha = None
+
+    # ------------------------------------------------------------------
     # 5. Écrire les COG + upload B2
     # ------------------------------------------------------------------
     scene_date = item.properties.get("datetime", "")[:10]
@@ -581,7 +736,7 @@ def generate_sentinel_composites_for_parcel(
         rgb_path = os.path.join(tmpdir, "sentinel_rgb.tif")
         ndvi_path = os.path.join(tmpdir, "sentinel_ndvi.tif")
 
-        _write_rgb_cog(rgb[0], rgb[1], rgb[2], transform, crs, rgb_path)
+        _write_rgb_cog(rgb[0], rgb[1], rgb[2], transform, crs, rgb_path, alpha=rgb_alpha)
         _write_single_band_cog(ndvi, transform, crs, ndvi_path, dtype="float32")
 
         suffix = uuid.uuid4().hex[:8]
@@ -598,6 +753,7 @@ def generate_sentinel_composites_for_parcel(
         ndvi_url = upload_file_to_b2(ndvi_path, ndvi_key)
 
     return {
+        "parcel_valid_ratio": round(valid_ratio, 3),
         "rgb_url": rgb_url,
         "rgb_key": rgb_key,
         "ndvi_url": ndvi_url,
@@ -609,38 +765,13 @@ def generate_sentinel_composites_for_parcel(
     }
 
 
-# ======================================================================
-# ======================================================================
-# NOUVELLE SECTION — INGESTION DES 14 INDICES SPECTRAUX
-# ======================================================================
-# ======================================================================
-#
-# Cette section étend le pipeline existant (RGB + NDVI) pour calculer
-# les 14 indices spectraux, écrire les 4 COG (3 séparés + 1 multi-bande),
-# les uploader sur B2 et insérer les stats dans `indice_reading`.
-#
-# Architecture hybride :
-#   - 3 COG séparés (visuels) : NDVI, NDMI, NDWI
-#   - 1 COG multi-bande (11)  : NDRE, EVI, SAVI, MSAVI, NBR,
-#                                REDEDGE, VARI, CARBONATE, SI_SOIL,
-#                                PSRI, FCOVER
-#
-# ⚠️  La fonction `generate_sentinel_composites_for_parcel()` ci-dessus
-#     reste INCHANGÉE (rétro-compatibilité RGB + NDVI seuls).
-# ======================================================================
 
-
-# ----------------------------------------------------------------------
-# Configuration spécifique aux 14 indices
-# ----------------------------------------------------------------------
+# ======================================================================
+# INGESTION DES 14 INDICES SPECTRAUX
+# ======================================================================
 
 # Toutes les bandes requises par au moins un indice
 ALL_BANDS_FOR_INDICES = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12"]
-
-
-# ----------------------------------------------------------------------
-# Helpers : récupération des infos parcel
-# ----------------------------------------------------------------------
 
 
 def _get_farm_id_for_parcel(db: Session, parcel_id: int) -> int | None:
@@ -650,11 +781,6 @@ def _get_farm_id_for_parcel(db: Session, parcel_id: int) -> int | None:
         {"parcel_id": parcel_id},
     ).fetchone()
     return row.farm_id if row else None
-
-
-# ----------------------------------------------------------------------
-# ÉTAPE 1 — Téléchargement de TOUTES les bandes nécessaires
-# ----------------------------------------------------------------------
 
 
 def _download_all_bands(
@@ -667,19 +793,12 @@ def _download_all_bands(
 
     Returns:
         (bands_dict, cloud_mask, ref_da)
-          - bands_dict : {"B02": arr, "B03": arr, ..., "B12": arr}
-          - cloud_mask : masque SCL (True = nuage) aligné sur B04, ou None
-          - ref_da     : DataArray de référence (B04) pour transform/crs
     """
-    # Vérifier les bandes manquantes
     available = set(item.assets.keys())
     missing = [b for b in ALL_BANDS_FOR_INDICES if b not in available]
     if missing:
-        logger.warning(
-            "[Indices] Bandes manquantes dans la scène : %s", missing
-        )
+        logger.warning("[Indices] Bandes manquantes dans la scène : %s", missing)
 
-    # On télécharge uniquement les bandes présentes
     bands_to_load = [b for b in ALL_BANDS_FOR_INDICES if b in available]
 
     if BAND_RED not in bands_to_load:
@@ -687,28 +806,27 @@ def _download_all_bands(
             "B04 (Red) obligatoire manquante — impossible d'aligner les bandes"
         )
 
-    # Charger B04 en premier (référence de grille)
-    ref_da = _clip_band_to_bbox(
-        item, BAND_RED, bbox, target_resolution=target_resolution
-    )
+    ref_da = _clip_band_to_bbox(item, BAND_RED, bbox, target_resolution=target_resolution)
 
     bands_dict: dict[str, np.ndarray] = {}
     bands_dict[BAND_RED] = ref_da.values[0].astype("float32")
 
-    # Charger les autres bandes alignées sur B04
     for band in bands_to_load:
         if band == BAND_RED:
             continue
         try:
-            da = _clip_band_to_bbox(
-                item, band, bbox, target_resolution=target_resolution
-            )
+            da = _clip_band_to_bbox(item, band, bbox, target_resolution=target_resolution)
             da = da.rio.reproject_match(ref_da, resampling=Resampling.bilinear)
             bands_dict[band] = da.values[0].astype("float32")
         except Exception as e:
             logger.warning("[Indices] Échec chargement %s : %s", band, e)
 
-    # Charger SCL (nearest, PAS d'upsampling)
+    # Valeurs brutes → réflectance (0 à 1), selon la version de traitement.
+    # Les constantes d'EVI, SAVI et MSAVI supposent des réflectances.
+    offset = _boa_offset(item)
+    bands_dict = {b: _to_reflectance(arr, offset) for b, arr in bands_dict.items()}
+    logger.info("[Indices] Bandes converties en réflectance (décalage : %s)", offset)
+
     cloud_mask: np.ndarray | None = None
     try:
         scl_da = _clip_band_to_bbox(item, BAND_SCL, bbox, target_resolution=None)
@@ -727,33 +845,18 @@ def _download_all_bands(
     return bands_dict, cloud_mask, ref_da
 
 
-# ----------------------------------------------------------------------
-# ÉTAPE 2 — Application du masque SCL sur toutes les bandes
-# ----------------------------------------------------------------------
-
-
 def _apply_cloud_mask(
     bands: dict[str, np.ndarray],
     cloud_mask: np.ndarray | None,
 ) -> dict[str, np.ndarray]:
-    """
-    Applique le masque SCL (True = nuage) sur toutes les bandes.
-
-    Les pixels nuageux deviennent NaN.
-    """
+    """Applique le masque SCL : les pixels nuageux deviennent NaN."""
     if cloud_mask is None:
         return bands
 
     masked: dict[str, np.ndarray] = {}
     for band, arr in bands.items():
-        arr_m = np.where(cloud_mask, np.nan, arr).astype("float32")
-        masked[band] = arr_m
+        masked[band] = np.where(cloud_mask, np.nan, arr).astype("float32")
     return masked
-
-
-# ----------------------------------------------------------------------
-# ÉTAPE 3 — Cache : vérifier si une scène est déjà ingérée
-# ----------------------------------------------------------------------
 
 
 def _check_scene_in_cache(
@@ -761,12 +864,7 @@ def _check_scene_in_cache(
     parcel_id: int,
     scene_id: str,
 ) -> tuple[bool, float | None]:
-    """
-    Vérifie si une scène est déjà ingérée pour cette parcelle.
-
-    Returns:
-        (already_exists, existing_cloud_cover)
-    """
+    """Vérifie si une scène est déjà ingérée pour cette parcelle."""
     row = db.execute(
         text("""
             SELECT cloud_cover
@@ -782,17 +880,8 @@ def _check_scene_in_cache(
     return True, row.cloud_cover
 
 
-# ----------------------------------------------------------------------
-# ÉTAPE 4 — Suppression des anciennes lignes (si remplacement)
-# ----------------------------------------------------------------------
-
-
-def _delete_scene_readings(
-    db: Session,
-    parcel_id: int,
-    scene_id: str,
-) -> int:
-    """Supprime toutes les lignes d'une scène donnée. Retourne le nb supprimé."""
+def _delete_scene_readings(db: Session, parcel_id: int, scene_id: str) -> int:
+    """Supprime toutes les lignes d'une scène. Retourne le nb supprimé."""
     result = db.execute(
         text("""
             DELETE FROM indice_reading
@@ -801,11 +890,6 @@ def _delete_scene_readings(
         {"parcel_id": parcel_id, "scene_id": scene_id},
     )
     return result.rowcount
-
-
-# ----------------------------------------------------------------------
-# ÉTAPE 5 — Insertion en base (une ligne par indice)
-# ----------------------------------------------------------------------
 
 
 def _insert_indice_readings(
@@ -818,12 +902,7 @@ def _insert_indice_readings(
     stats_by_indice: dict[str, dict],
     b2_keys: dict[str, str],
 ) -> int:
-    """
-    Insère les lignes `indice_reading` pour chaque indice calculé.
-
-    Returns:
-        Nombre de lignes insérées.
-    """
+    """Insère les lignes `indice_reading` pour chaque indice calculé."""
     inserted = 0
 
     def b2_key_for(indice_name: str) -> str | None:
@@ -886,11 +965,6 @@ def _insert_indice_readings(
     return inserted
 
 
-# ----------------------------------------------------------------------
-# FONCTION PRINCIPALE — génération des 14 indices
-# ----------------------------------------------------------------------
-
-
 def generate_all_indices_for_parcel(
     db: Session,
     farm_id: int,
@@ -899,34 +973,17 @@ def generate_all_indices_for_parcel(
     target_resolution: float = TARGET_RESOLUTION_M,
     *,
     force_refresh: bool = False,
+    item=None,
 ) -> dict | None:
     """
     Génère les 14 indices spectraux pour une parcelle et insère les stats.
 
-    Flux :
-      1. Recherche STAC (meilleure scène)
-      2. Vérification cache (skip ou remplace selon cloud_cover)
-      3. Téléchargement des 8 bandes + SCL
-      4. Masquage SCL
-      5. Calcul des 14 indices
-      6. Écriture des 4 COG (3 séparés + 1 multi-bande)
-      7. Upload B2
-      8. Stats zonales (polygone exact) + validation
-      9. Insertion en base
+    `item` : scène imposée (recalcul de l'historique). Sans lui, la scène
+    est choisie automatiquement, comme d'habitude.
 
-    Args:
-        force_refresh: si True, ignore le cache et remplace même si la
-                       scène existante a moins de nuages.
-
-    Returns:
-        dict avec :
-          - scene_id, scene_date, cloud_cover
-          - inserted : nombre de lignes insérées
-          - skipped  : nombre d'indices skippés
-          - b2_keys  : dict des clés B2
-          - indices_calculated : liste des indices calculés
-          - indices_skipped    : dict {indice: raison}
-        ou None si aucune scène / aucune géométrie.
+    La scène est choisie sur la part de PARCELLE visible (bande SCL), et
+    non sur le taux de nuages de la scène entière : on obtient ainsi
+    l'image la plus récente réellement exploitable.
     """
     # ------------------------------------------------------------------
     # 0. Vérifs préliminaires
@@ -944,12 +1001,16 @@ def generate_all_indices_for_parcel(
     logger.info("[Indices] Bbox parcelle %s : %s", parcel_id, bbox)
 
     # ------------------------------------------------------------------
-    # 1. Recherche STAC
+    # 1. Sélection de la scène
     # ------------------------------------------------------------------
-    item = _search_best_scene(bbox, lookback_days=lookback_days)
     if item is None:
-        logger.info("[Indices] Aucune scène trouvée pour parcel %s", parcel_id)
-        return None
+        item, parcel_valid_ratio = _select_usable_scene(db, parcel_id, bbox, lookback_days)
+        if item is None:
+            logger.info("[Indices] Aucune scène trouvée pour parcel %s", parcel_id)
+            return None
+    else:
+        parcel_valid_ratio = None
+        logger.info("[Indices] Scène imposée : %s", item.id)
 
     scene_id = item.id
     scene_date_str = item.properties.get("datetime", "")[:10]
@@ -960,7 +1021,6 @@ def generate_all_indices_for_parcel(
         scene_id, cloud_cover if cloud_cover is not None else -1,
     )
 
-
     # ------------------------------------------------------------------
     # 2. Vérification cache
     # ------------------------------------------------------------------
@@ -968,21 +1028,18 @@ def generate_all_indices_for_parcel(
 
     if already:
         if force_refresh:
-            # force_refresh=True → on supprime systématiquement
             deleted = _delete_scene_readings(db, parcel_id, scene_id)
             logger.info(
                 "[Indices] force_refresh=True → REMPLACE (%d lignes supprimées)",
                 deleted,
             )
-        elif (
-            existing_cloud is not None
-            and cloud_cover is not None
-            and cloud_cover >= existing_cloud
-        ):
-            # La nouvelle scène est moins bonne → SKIP
+        else:
+            # Même scène déjà en base : la fraîcheur est arbitrée en amont
+            # par _select_usable_scene. Si on retombe sur celle-ci, c'est
+            # qu'aucune image plus récente n'est exploitable.
             logger.info(
-                "[Indices] Scène déjà ingérée avec clouds=%.4f%% ≤ nouvelle (%.4f%%) → SKIP",
-                existing_cloud, cloud_cover,
+                "[Indices] Scène %s déjà ingérée et toujours la plus récente exploitable → SKIP",
+                scene_id,
             )
             return {
                 "scene_id": scene_id,
@@ -995,13 +1052,6 @@ def generate_all_indices_for_parcel(
                 "indices_calculated": [],
                 "indices_skipped": {},
             }
-        else:
-            # La nouvelle scène est meilleure → REMPLACE
-            deleted = _delete_scene_readings(db, parcel_id, scene_id)
-            logger.info(
-                "[Indices] Scène déjà ingérée mais nouvelle moins nuageuse → REMPLACE (%d lignes supprimées)",
-                deleted,
-            )
 
     # ------------------------------------------------------------------
     # 3. Téléchargement des bandes
@@ -1014,8 +1064,7 @@ def generate_all_indices_for_parcel(
     indices_calculables = filter_available_indices(available_bands)
     logger.info(
         "[Indices] %d/%d indices calculables (bandes dispo : %s)",
-        len(indices_calculables), len(list_indice_names()),
-        sorted(available_bands),
+        len(indices_calculables), len(list_indice_names()), sorted(available_bands),
     )
 
     # ------------------------------------------------------------------
@@ -1024,7 +1073,7 @@ def generate_all_indices_for_parcel(
     bands_masked = _apply_cloud_mask(bands, cloud_mask)
 
     # ------------------------------------------------------------------
-    # 5. Calcul des 14 indices
+    # 5. Calcul des indices
     # ------------------------------------------------------------------
     results = compute_all_indices(bands_masked)
 
@@ -1039,8 +1088,7 @@ def generate_all_indices_for_parcel(
             indices_ok[name] = arr
 
     logger.info(
-        "[Indices] %d calculés, %d skippés",
-        len(indices_ok), len(indices_skipped),
+        "[Indices] %d calculés, %d skippés", len(indices_ok), len(indices_skipped)
     )
 
     if not indices_ok:
@@ -1057,7 +1105,7 @@ def generate_all_indices_for_parcel(
         }
 
     # ------------------------------------------------------------------
-    # 6. Écriture des 4 COG
+    # 6. Écriture des COG
     # ------------------------------------------------------------------
     transform = ref_da.rio.transform()
     crs = ref_da.rio.crs
@@ -1086,9 +1134,7 @@ def generate_all_indices_for_parcel(
             n for n in list(SEPARATE_COGS) + list(MULTIBAND_ORDER.values())
             if n not in indices_ok
         ]
-        logger.warning(
-            "[Indices] COG NON écrits (indices manquants : %s)", missing
-        )
+        logger.warning("[Indices] COG NON écrits (indices manquants : %s)", missing)
 
     # ------------------------------------------------------------------
     # 7. Upload B2
@@ -1159,6 +1205,9 @@ def generate_all_indices_for_parcel(
         "scene_id": scene_id,
         "scene_date": scene_date_str,
         "cloud_cover": cloud_cover,
+        "parcel_valid_ratio": (
+            round(parcel_valid_ratio, 3) if parcel_valid_ratio is not None else None
+        ),
         "inserted": inserted,
         "skipped": len(indices_skipped),
         "cached": False,
@@ -1169,20 +1218,13 @@ def generate_all_indices_for_parcel(
     }
 
 
-# ----------------------------------------------------------------------
-# Wrapper public (utilisé par les tâches Celery)
-# ----------------------------------------------------------------------
-
-
 def generate_all_indices_for_parcel_safe(
     parcel_id: int,
     *,
     force_refresh: bool = False,
 ) -> dict | None:
     """
-    Version safe de `generate_all_indices_for_parcel` qui ouvre sa propre
-    session DB et la ferme proprement.
-
+    Version safe qui ouvre sa propre session DB et la ferme proprement.
     Utilisée par les tâches Celery (`ingestion_tasks.py`).
     """
     from app.db.database import SessionLocal
@@ -1203,11 +1245,6 @@ def generate_all_indices_for_parcel_safe(
         db.close()
 
 
-# ----------------------------------------------------------------------
-# Endpoint utilitaire — palettes à renvoyer au frontend
-# ----------------------------------------------------------------------
-
-
 def get_all_indice_palettes() -> dict[str, list[list[int | float]]]:
-    """Récupère toutes les palettes des 14 indices (pour le frontend)."""
+    """Récupère toutes les palettes des indices (pour le frontend)."""
     return dict(INDICE_PALETTES)

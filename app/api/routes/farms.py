@@ -106,10 +106,38 @@ async def delete_farm(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    result = db.execute(
-        text("DELETE FROM farm WHERE id = :farm_id AND user_id = :user_id RETURNING id"),
+    existing = db.execute(
+        text("SELECT id FROM farm WHERE id = :farm_id AND user_id = :user_id"),
         {"farm_id": farm_id, "user_id": current_user.id},
+    ).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Ferme introuvable ou non autorisée.")
+
+    # La clé étrangère activity.parcel_id n'a pas de ON DELETE CASCADE :
+    # on supprime d'abord les affectations d'employés et les activités des
+    # parcelles de la ferme, puis la ferme (parcelles, affectations
+    # ferme-employé, alertes, indices et rasters suivent par cascade).
+    # Le tout dans une seule transaction.
+    db.execute(
+        text("""
+            DELETE FROM activity_employee
+            WHERE activity_id IN (
+                SELECT a.id FROM activity a
+                JOIN parcel p ON p.id = a.parcel_id
+                WHERE p.farm_id = :farm_id
+            )
+        """),
+        {"farm_id": farm_id},
+    )
+    db.execute(
+        text("""
+            DELETE FROM activity
+            WHERE parcel_id IN (SELECT id FROM parcel WHERE farm_id = :farm_id)
+        """),
+        {"farm_id": farm_id},
+    )
+    db.execute(
+        text("DELETE FROM farm WHERE id = :farm_id"),
+        {"farm_id": farm_id},
     )
     db.commit()
-    if not result.fetchone():
-        raise HTTPException(status_code=404, detail="Ferme introuvable ou non autorisée.")

@@ -37,3 +37,5 @@ class Parcel(Base):
     alerts = relationship("Alert", back_populates="parcel", cascade="all, delete-orphan")
     indice_readings = relationship("IndiceReading", back_populates="parcel", cascade="all, delete-orphan")
     rasters = relationship("Raster", back_populates="parcel", cascade="all, delete-orphan", order_by="Raster.created_at.desc()")
+    analyses = relationship("ParcelAnalysis", back_populates="parcel", cascade="all, delete-orphan", order_by="ParcelAnalysis.analyzed_at.desc()")
+    crops = relationship("Crop", back_populates="parcel", cascade="all, delete-orphan", order_by="Crop.planting_date.desc()")

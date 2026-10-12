@@ -17,7 +17,7 @@ cloudinary.config(
     api_secret=CLOUDINARY_API_SECRET,
 )
 
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 Mo
 
 
@@ -32,7 +32,7 @@ async def save_avatar(file: UploadFile, user_id: int) -> str:
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'image non autorisé. Utilisez JPG, PNG, WEBP ou GIF.",
+            detail="Format d'image non autorisé. Utilisez JPG, PNG ou WEBP.",
         )
 
     # Lire le contenu

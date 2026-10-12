@@ -72,7 +72,9 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session invalide ou expirée.")
 
         token_issued_at_dt = datetime.fromtimestamp(token_issued_at, tz=timezone.utc)
-        if token_issued_at_dt < user.password_changed_at:
+        # `iat` est en secondes entières : on compare à la seconde près, sinon un
+        # cookie émis dans la même seconde que le changement serait refusé.
+        if token_issued_at_dt < user.password_changed_at.replace(microsecond=0):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expirée, veuillez vous reconnecter.")
 
     return user

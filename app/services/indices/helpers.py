@@ -194,45 +194,4 @@ def nan_to_nodata(arr: np.ndarray, nodata: float = NODATA_VALUE) -> np.ndarray:
 
 # ======================================================================
 # Statistiques robustes (ignorent les NaN)
-# ======================================================================
-
-
-def zonal_stats(arr: np.ndarray) -> dict:
-    """
-    Calcule les statistiques d'un tableau en ignorant les NaN.
-
-    Args:
-        arr: tableau (float32)
-
-    Returns:
-        dict avec : count, valid_count, nan_count, mean, min, max, std, median
-        Toutes les valeurs numériques sont des float Python (ou None si vide).
-    """
-    arr32 = np.asarray(arr, dtype=np.float32).ravel()
-    total = int(arr32.size)
-    finite = arr32[np.isfinite(arr32)]
-    valid = int(finite.size)
-    nan_count = total - valid
-
-    if valid == 0:
-        return {
-            "count": total,
-            "valid_count": 0,
-            "nan_count": nan_count,
-            "mean": None,
-            "min": None,
-            "max": None,
-            "std": None,
-            "median": None,
-        }
-
-    return {
-        "count": total,
-        "valid_count": valid,
-        "nan_count": nan_count,
-        "mean": float(np.mean(finite)),
-        "min": float(np.min(finite)),
-        "max": float(np.max(finite)),
-        "std": float(np.std(finite)),
-        "median": float(np.median(finite)),
-    }
+# ========================================

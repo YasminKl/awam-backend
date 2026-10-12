@@ -14,21 +14,6 @@ REMINDER_DELTAS = {
     "1_week": timedelta(weeks=1),
 }
 
-# Texte affiché dans l'email pour chaque valeur de reminder préréglée
-REMINDER_LABELS = {
-    "15_min": "dans 15 minutes",
-    "1_hour": "dans 1 heure",
-    "1_day": "demain",
-    "1_week": "dans 1 semaine",
-}
-
-# Pluriel pour l'unité d'un rappel personnalisé
-CUSTOM_UNIT_LABELS = {
-    "minutes": "minute(s)",
-    "hours": "heure(s)",
-    "days": "jour(s)",
-}
-
 
 def get_reminder_delta(event: AgendaEvent) -> timedelta | None:
     if not event.reminder:
@@ -40,43 +25,17 @@ def get_reminder_delta(event: AgendaEvent) -> timedelta | None:
     return REMINDER_DELTAS.get(event.reminder)
 
 
-def get_reminder_label(event: AgendaEvent) -> str:
-    """
-    Texte lisible du délai réel choisi, pour l'email de rappel.
-
-    Utilise getattr(..., None) plutôt qu'un accès direct : si le modèle
-    AgendaEvent perd/renomme une colonne de rappel, on retombe sur une
-    valeur par défaut au lieu de planter toute la tâche Celery.
-    """
-    reminder = getattr(event, "reminder", None)
-    if not reminder:
-        return "bientôt"
-
-    if reminder == "custom":
-        minutes = getattr(event, "reminder_custom_minutes", None)
-        if not minutes:
-            return "bientôt"
-        unit = getattr(event, "reminder_custom_unit", None) or "minutes"
-        unit_label = CUSTOM_UNIT_LABELS.get(unit, unit)
-        return f"dans {minutes} {unit_label}"
-
-    return REMINDER_LABELS.get(reminder, "bientôt")
-
-
 @celery_app.task(name="app.tasks.agenda_tasks.check_and_send_reminders")
 def check_and_send_reminders():
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
 
-        # Plus de filtre sur `status` : un rappel est envoyé pour
-        # n'importe quel statut (a_faire, fait, reporte, annule...),
-        # tant que le délai de rappel est atteint et qu'il n'a pas déjà
-        # été envoyé.
         events = (
             db.query(AgendaEvent)
             .filter(
                 AgendaEvent.reminder_sent == False,
+                AgendaEvent.status == "a_faire",
                 AgendaEvent.start_at > now,
             )
             .all()
@@ -98,15 +57,9 @@ def check_and_send_reminders():
                 continue
 
             event_datetime_str = event.start_at.strftime("%d/%m/%Y à %H:%M")
-            reminder_label = get_reminder_label(event)
 
             try:
-                send_agenda_reminder_email(
-                    user.email,
-                    event.title,
-                    event_datetime_str,
-                    reminder_label,
-                )
+                send_agenda_reminder_email(user.email, event.title, event_datetime_str)
                 event.reminder_sent = True
                 db.commit()
                 sent_count += 1

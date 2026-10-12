@@ -3,13 +3,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.security import get_current_user
 from app.models.utilisateur import User
+from app.schemas.weather import WeatherResponse
 
 router = APIRouter(tags=["weather"])
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 
-@router.get("/weather")
+@router.get("/weather", response_model=WeatherResponse)
 async def get_weather(
     latitude: float,
     longitude: float,

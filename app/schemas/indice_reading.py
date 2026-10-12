@@ -119,3 +119,4 @@ class IndiceAvailableResponse(BaseModel):
     parcel_id: int
     indices: list[str] = Field(..., description="Noms des indices disponibles")
     count: int = Field(..., description="Nombre d'indices disponibles")
+

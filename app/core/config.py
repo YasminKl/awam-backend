@@ -9,10 +9,6 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
-print(f"🔵 GOOGLE_CLIENT_ID = {GOOGLE_CLIENT_ID[:20]}...")  # Affiche les 20 premiers caractères
-print(f"🔵 GOOGLE_REDIRECT_URI = {GOOGLE_REDIRECT_URI}")
-
-
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 1
@@ -38,7 +34,8 @@ if not SESSION_SECRET_KEY:
 print("✅ config.py chargé avec succès !")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+# ⬅️ CASSE E-MAIL : en minuscules, comme tous les e-mails enregistrés en base
+ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower() or None
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "onboarding@resend.dev")
@@ -62,7 +59,6 @@ if not REDIS_URL:
     raise ValueError("REDIS_URL doit être défini dans .env")
 
 
-
 # ----------------------------------------------------------------------
 # Backblaze B2
 # ----------------------------------------------------------------------
@@ -77,5 +73,3 @@ if not all([B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME, B2_ENDPOINT_URL]):
         "B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME et B2_ENDPOINT_URL "
         "doivent être définis dans .env"
     )
-
-

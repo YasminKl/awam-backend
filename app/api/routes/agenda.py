@@ -1,5 +1,6 @@
 from typing import List
 
+
 from fastapi import APIRouter, Depends, HTTPException, status as http_status
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,7 @@ async def create_event(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+
     new_event = AgendaEvent(
         user_id=current_user.id,
         title=payload.title,

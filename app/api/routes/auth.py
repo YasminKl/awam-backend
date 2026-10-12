@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
+from authlib.integrations.starlette_client import OAuthError
+from sqlalchemy import func  # ⬅️ CASSE E-MAIL
 from sqlalchemy.orm import Session
 import secrets
 import hashlib
@@ -50,7 +52,7 @@ def _hash_reset_token(token: str) -> str:
 
 @router.post("/register", response_model=AuthResponse)
 async def register(payload: RegisterRequest, response: Response, db: Session = Depends(get_db)):
-    existing_user = db.query(User).filter(User.email == payload.email).first()
+    existing_user = db.query(User).filter(func.lower(User.email) == payload.email).first()  # ⬅️ CASSE E-MAIL
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -78,7 +80,7 @@ async def register(payload: RegisterRequest, response: Response, db: Session = D
 
 @router.post("/login", response_model=AuthResponse)
 async def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
+    user = db.query(User).filter(func.lower(User.email) == payload.email).first()  # ⬅️ CASSE E-MAIL
 
     if not user or not user.password_hash:
         raise HTTPException(
@@ -103,7 +105,12 @@ async def google_login(request: Request):
 
 @router.get("/google/callback")
 async def google_callback(request: Request, db: Session = Depends(get_db)):
-    token = await oauth.google.authorize_access_token(request)
+    try:
+        token = await oauth.google.authorize_access_token(request)
+    except OAuthError:
+        # Connexion annulée par l'utilisateur ou refusée par Google
+        return RedirectResponse(f"{FRONTEND_URL}/login?error=google_auth_failed")
+
     userinfo = token.get("userinfo")
 
     if not userinfo:
@@ -128,7 +135,7 @@ async def get_me(user: User = Depends(get_current_user)):
 
 @router.post("/forgot-password")
 async def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
+    user = db.query(User).filter(func.lower(User.email) == payload.email).first()  # ⬅️ CASSE E-MAIL
 
     if user:
         token = secrets.token_urlsafe(32)
@@ -186,6 +193,7 @@ async def reset_password(token: str, payload: ResetPasswordRequest, db: Session 
         )
 
     user.password_hash = hash_password(payload.password)
+    user.password_changed_at = datetime.now(timezone.utc)  # invalide les sessions ouvertes avant la réinitialisation
     user.reset_token = None
     user.reset_token_expires = None
     db.commit()

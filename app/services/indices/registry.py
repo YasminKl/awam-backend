@@ -112,6 +112,18 @@ INDICES_REGISTRY: dict[str, IndiceSpec] = {
         separate_cog=True,
     ),
 
+    "MSI": IndiceSpec(
+        name="MSI",
+        formula="B11 / B08",
+        required_bands=("B08", "B11"),
+        theoretical_min=0.0,
+        theoretical_max=3.0,
+        calc_func_name="calc_msi",
+        description="Indice de stress hydrique (Moisture Stress Index)",
+        multi_band_order=None,
+        separate_cog=False,
+    ),
+
     # ------------------------------------------------------------------
     # 3. NDWI — Normalized Difference Water Index (McFeeters 1996)
     #    Détection des surfaces en eau (Green vs NIR).
@@ -280,8 +292,8 @@ INDICES_REGISTRY: dict[str, IndiceSpec] = {
     # ------------------------------------------------------------------
     "PSRI": IndiceSpec(
         name="PSRI",
-        formula="(B04 - B03) / B06",
-        required_bands=("B03", "B04", "B06"),
+        formula="(B04 - B02) / B06",
+        required_bands=("B02", "B04", "B06"),
         theoretical_min=-1.0,
         theoretical_max=1.0,
         calc_func_name="calc_psri",

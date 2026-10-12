@@ -18,7 +18,8 @@ celery_app = Celery(
     include=[
         "app.tasks.agenda_tasks",
         "app.tasks.parcel_tasks",
-        "app.tasks.ingestion_tasks",   # 🆕 14 indices spectraux
+        "app.tasks.ingestion_tasks",   # 14 indices spectraux
+        "app.tasks.weather_tasks",  # historique météo
     ],
 )
 
@@ -80,7 +81,8 @@ celery_app.conf.task_routes = {
     "app.tasks.agenda_tasks.*":  {"queue": "awam_queues:agenda"},
     "parcels.*": {"queue": "awam_queues:parcelles"},
     "app.tasks.parcel_tasks.*":  {"queue": "awam_queues:parcelles"},
-    "app.tasks.ingestion_tasks.*": {"queue": "awam_queues:parcelles"},  # 🆕
+    "app.tasks.ingestion_tasks.*": {"queue": "awam_queues:parcelles"},  
+    "weather.*": {"queue": "awam_queues:parcelles"},
 }
 
 # ------------------------------------------------------------------
@@ -96,8 +98,18 @@ celery_app.conf.beat_schedule = {
         "options": {"queue": "awam_queues:agenda"},
     },
 
+
+    "sync-weather-daily": {
+        "task": "weather.sync_daily",
+        "schedule": crontab(hour=5, minute=30),
+        "options": {
+            "queue": "awam_queues:parcelles",
+            "expires": 3600,
+        },
+    },
+
     # ------------------------------------------------------------------
-    # 🆕 Ingestion quotidienne des 14 indices spectraux
+    # Ingestion quotidienne des 14 indices spectraux
     #    Tous les jours à 6h du matin (heure Tunis)
     # ------------------------------------------------------------------
     "ingest-parcel-indices-daily": {
