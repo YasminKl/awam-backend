@@ -33,6 +33,11 @@ class Crop(Base):
     expected_harvest_date = Column(Date, nullable=True)
     #: Renseignée à la main, ou déduite d'une activité de type récolte
     actual_harvest_date = Column(Date, nullable=True)
+    #: Production réellement récoltée, saisie par l'utilisateur quand la
+    #: culture est récoltée (total de la saison pour les cultures coupées
+    #: plusieurs fois). Unité : "kg" ou "t".
+    actual_yield = Column(Float, nullable=True)
+    yield_unit = Column(String(10), nullable=True)
 
     #: Plants par hectare, saisie (non mesurable par satellite)
     density = Column(Float, nullable=True)

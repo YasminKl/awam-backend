@@ -9,6 +9,8 @@ from app.models.farm import Farm
 from app.models.parcel import Parcel
 from app.models.indice_reading import IndiceReading
 from app.schemas.indice_reading import IndiceReadingResponse
+from app.schemas.indice_baseline import IndiceBaselineResponse
+from app.services.baseline_service import baseline_for_latest
 
 router = APIRouter(tags=["indices"])
 
@@ -57,3 +59,23 @@ async def list_available_indices(
         .all()
     )
     return [r[0] for r in rows]
+
+
+@router.get(
+    "/parcels/{parcel_id}/indices/{indice_name}/baseline",
+    response_model=IndiceBaselineResponse,
+)
+async def get_indice_baseline(
+    parcel_id: int,
+    indice_name: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Plage habituelle de l'indice pour cette parcelle, à la période de sa
+    mesure la plus récente : calculée sur les années précédentes, à 15
+    jours près autour de la même date. Situe aussi la dernière valeur.
+    """
+    _get_owned_parcel(parcel_id, user, db)
+    baseline = baseline_for_latest(db, parcel_id, indice_name.upper())
+    return IndiceBaselineResponse(**baseline.__dict__)

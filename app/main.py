@@ -56,6 +56,7 @@ from app.api.routes.weather import router as weather_router
 from app.api.routes.parcel_analyses import router as parcel_analyses_router
 from app.api.routes.crops import router as crops_router
 from app.api.routes.diagnosis import router as diagnosis_router
+from app.api.routes.events import router as events_router
 
 print("🔵 Lancement de l'application FastAPI...")
 
@@ -118,8 +119,8 @@ app.include_router(alerts_router, prefix="/api")
 print("🔵 Ajout du router employees...")
 app.include_router(employees_router, prefix="/api")
 
-print("🔵 Ajout du router farm_employees...")  # ⬅️ AJOUT
-app.include_router(farm_employees_router, prefix="/api")  # ⬅️ AJOUT
+print("🔵 Ajout du router farm_employees...")  
+app.include_router(farm_employees_router, prefix="/api")  
 
 print("🔵 Ajout du router activities...")
 app.include_router(activities_router, prefix="/api")
@@ -135,6 +136,9 @@ app.include_router(crops_router, prefix="/api")
 
 print("🔵 Ajout du router diagnosis...")
 app.include_router(diagnosis_router, prefix="/api")
+
+print("🔵 Ajout du router events...")
+app.include_router(events_router, prefix="/api")
 
 # ==================================================================
 # Titiler

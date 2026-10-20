@@ -1,11 +1,56 @@
 from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from app.services.agronomy.species import SPECIES
 
 CropStatus = Literal["active", "harvested", "abandoned"]
+#: Unité de la production réelle
+YieldUnit = Literal["kg", "t"]
+
+
+def check_crop_dates(
+    planting_date: Optional[date],
+    expected_harvest_date: Optional[date],
+    actual_harvest_date: Optional[date],
+    today: Optional[date] = None,
+) -> None:
+    """
+    Cohérence des dates d'une culture. Lève ValueError avec un message
+    lisible par l'utilisateur. Utilisée à la création (schéma) et à la
+    modification (route, sur l'état final de la culture).
+    """
+    today = today or date.today()
+    if planting_date and planting_date > today:
+        raise ValueError("La date de plantation ne peut pas être dans le futur.")
+    if planting_date and expected_harvest_date and expected_harvest_date < planting_date:
+        raise ValueError("La récolte prévue ne peut pas précéder la plantation.")
+    if actual_harvest_date:
+        if actual_harvest_date > today:
+            raise ValueError("La récolte réelle ne peut pas être dans le futur.")
+        if planting_date and actual_harvest_date < planting_date:
+            raise ValueError("La récolte réelle ne peut pas précéder la plantation.")
+
+
+def check_harvest(
+    status: Optional[str],
+    actual_harvest_date: Optional[date],
+    actual_yield: Optional[float],
+    yield_unit: Optional[str],
+) -> None:
+    """
+    Une culture récoltée doit porter la date de récolte et la production
+    réelles, saisies par l'utilisateur pour la traçabilité.
+    """
+    if status != "harvested":
+        return
+    if actual_harvest_date is None:
+        raise ValueError("Indiquez la date de récolte.")
+    if actual_yield is None:
+        raise ValueError("Indiquez la production récoltée.")
+    if yield_unit is None:
+        raise ValueError("Indiquez l'unité de la production (kg ou t).")
 
 
 class CropBase(BaseModel):
@@ -14,6 +59,9 @@ class CropBase(BaseModel):
     planting_date: Optional[date] = None
     expected_harvest_date: Optional[date] = None
     actual_harvest_date: Optional[date] = None
+    #: Production réelle, quand la culture est récoltée
+    actual_yield: Optional[float] = None
+    yield_unit: Optional[YieldUnit] = None
     density: Optional[float] = None
     #: Arbres fruitiers : le verger produit-il déjà ?
     in_production: bool = False
@@ -40,10 +88,27 @@ class CropBase(BaseModel):
             raise ValueError("La densité doit être un nombre positif.")
         return v
 
+    @field_validator("actual_yield")
+    @classmethod
+    def yield_positive(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError("La production doit être un nombre positif.")
+        return v
+
 
 class CropCreate(CropBase):
     parcel_id: int
     status: CropStatus = "active"
+    #: Obligatoire à la création : elle donne l'âge (donc les seuils de
+    #: l'agronome), le stade des cultures annuelles, la récolte prévue et
+    #: le point de départ de l'historique. Une date approximative suffit.
+    planting_date: date
+
+    @model_validator(mode="after")
+    def dates_coherent(self) -> "CropCreate":
+        check_crop_dates(self.planting_date, self.expected_harvest_date, self.actual_harvest_date)
+        check_harvest(self.status, self.actual_harvest_date, self.actual_yield, self.yield_unit)
+        return self
 
 
 class CropUpdate(BaseModel):
@@ -54,10 +119,26 @@ class CropUpdate(BaseModel):
     planting_date: Optional[date] = None
     expected_harvest_date: Optional[date] = None
     actual_harvest_date: Optional[date] = None
+    actual_yield: Optional[float] = None
+    yield_unit: Optional[YieldUnit] = None
     density: Optional[float] = None
     in_production: Optional[bool] = None
     status: Optional[CropStatus] = None
     notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def planting_not_erased(self) -> "CropUpdate":
+        """La date de plantation peut être corrigée, mais pas effacée."""
+        if "planting_date" in self.model_fields_set and self.planting_date is None:
+            raise ValueError("La date de plantation est obligatoire.")
+        return self
+
+    @field_validator("actual_yield")
+    @classmethod
+    def yield_positive(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError("La production doit être un nombre positif.")
+        return v
 
     @field_validator("species")
     @classmethod
@@ -81,6 +162,10 @@ class CropResponse(CropBase):
     #: Vrai pour olivier, amandier, caroubier : le front affiche alors
     #: la case « Verger en production »
     is_orchard: bool = False
+    #: Vrai pour le basilic : une annuelle récoltée termine son cycle. Une
+    #: pérenne récoltée en ouvre un nouveau (le front affiche « Récoltée »
+    #: le jour de la récolte seulement)
+    is_annual: bool = False
     created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -105,6 +190,17 @@ class SpeciesOption(BaseModel):
     is_orchard: bool = False
     #: Variétés proposées dans la liste ; vide = saisie libre
     varieties: list[VarietyOption] = []
+
+
+class ExpectedHarvestPreview(BaseModel):
+    """
+    Récolte prévue calculée pour une espèce et une date de plantation, avant
+    l'enregistrement : le formulaire l'affiche dès la saisie.
+    """
+
+    expected_harvest_date: Optional[date] = None
+    #: Pourquoi aucune date, le cas échéant
+    reason: Optional[str] = None
 
 
 class CropSuggestions(BaseModel):

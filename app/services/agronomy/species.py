@@ -321,3 +321,101 @@ def parse_cultures(text: str | None) -> tuple[list[str], list[str]]:
         else:
             unknown.append(part)
     return found, unknown
+
+
+
+
+# ======================================================================
+# Délai entre la plantation (plants repiqués) et la PREMIÈRE récolte
+# ======================================================================
+#
+# Valeurs retenues après recherche croisée (Perplexity, Mistral,
+# référentiels AWAM du projet). Règle : une valeur est retenue si au moins
+# deux sources indépendantes concordent ; à défaut, la source la plus
+# proche de la Tunisie ; à égalité, la valeur la plus prudente.
+#
+# STATUT : toutes les valeurs sont « à confirmer ». Aucune référence
+# tunisienne officielle chiffrée n'a été trouvée, et les phrases citées
+# viennent de résumés d'outils d'IA, pas d'une lecture directe des
+# documents. Elles seront remplacées par les délais réels observés sur les
+# parcelles (date de plantation → date de première récolte) ou par l'avis
+# d'un expert tunisien (CRDA, INRAT).
+#
+# Arbres fruitiers : pas de délai ici. Leur récolte prévue dépend de la
+# case « verger en production » saisie par l'utilisateur.
+
+
+@dataclass(frozen=True)
+class FirstHarvestDelay:
+    """Délai avant la première récolte, avec sa justification."""
+
+    days: int
+    #: Sources qui contiennent ou recoupent la valeur
+    sources: str
+    #: Nombre de sources concordantes et statut de vérification
+    confidence: str
+
+
+FIRST_HARVEST_DELAYS: dict[str, FirstHarvestDelay] = {
+    "lavande": FirstHarvestDelay(
+        365,
+        "Fiche SUAMME (Languedoc-Roussillon sec) : « Pas de récolte la première année » ; "
+        "CRA Occitanie (lavandin) : « ne produit pas les douze premiers mois suivant la plantation » ; "
+        "référentiel AWAM : installation 0–1 an, floraison après 1 an",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "romarin": FirstHarvestDelay(
+        365,
+        "Fiche SUAMME (Languedoc-Roussillon sec) : « la première récolte intervient en année 2 » ; "
+        "référentiel AWAM : installation 0–1 an, pré-récolte après 1 an",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "thym": FirstHarvestDelay(
+        365,
+        "Fiche SUAMME (Languedoc-Roussillon sec) : « la 1ère récolte intervient en année 2 »",
+        "source unique, à confirmer",
+    ),
+    "sauge": FirstHarvestDelay(
+        75,
+        "UW–Madison Extension : « Sage takes about 75 days from planting to first harvest » ; "
+        "Permapotes : semis d'avril à juin, récolte de juin à octobre la même année",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "menthe": FirstHarvestDelay(
+        90,
+        "Référentiel AWAM : installation 0–3 mois ; Culture et production de la menthe (Maroc) : "
+        "« La 1ère coupe a lieu après 60 à 70 jours du début de la plantation » ; "
+        "source indienne : 100 à 120 jours. Valeur du référentiel AWAM, dans la fourchette des sources",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "geranium": FirstHarvestDelay(
+        182,
+        "Mémoire, université de Tlemcen (Algérie) : « La récolte des feuilles et des tiges se fait "
+        "à partir de 6 mois » ; J. Mater. Environ. Sci. : 6 à 8 mois ; "
+        "référentiel AWAM : installation 0–6 mois",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "verveine": FirstHarvestDelay(
+        0,
+        "Bio Nouvelle-Aquitaine : « 1ère année : 1 coupe », récolte mi-juillet ; "
+        "première récolte en juillet selon une seconde source : récolte possible dès la première saison",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "citronnelle": FirstHarvestDelay(
+        182,
+        "Atlaseeds (Maroc) : « 4 à 6 mois pour une première récolte » ; PROSEA : 6 à 8 mois ; "
+        "Useful Tropical Plants : 120 à 240 jours. Valeur commune aux trois",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+    "basilic": FirstHarvestDelay(
+        45,
+        "Industrial Crops and Products : première récolte « at 40 DAT » ; "
+        "extensions universitaires : 30 à 45 jours",
+        "plusieurs sources concordantes, à confirmer",
+    ),
+}
+
+
+def first_harvest_delay(code: str) -> FirstHarvestDelay | None:
+    """Délai avant la première récolte, ou None (arbres fruitiers, espèce inconnue)."""
+    return FIRST_HARVEST_DELAYS.get(code)

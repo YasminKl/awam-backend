@@ -17,6 +17,8 @@ Deux lectures complémentaires, car aucune ne suffit seule :
 Règles reprises du document agronomique :
   - le stade vient du calendrier, pas de la courbe (les pérennes n'ont
     pas de signal exploitable) ;
+  - les seuils viennent du document des indices, chacun à SA période et
+    pour SON âge (thresholds.get_rules_at), indépendamment du stade ;
   - une baisse pendant une coupe ou une récolte n'est jamais une alerte ;
   - ce n'est pas un indice isolé qui compte, mais leur combinaison ;
   - une anomalie n'est confirmée qu'à la seconde observation.
@@ -30,13 +32,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 
-from app.services.agronomy.calendar import get_stage_at, is_cultural_period
+from app.services.agronomy.calendar import get_stages_at, is_cultural_period
 from app.services.agronomy.species import get_species, is_deciduous, stage_label
-from app.services.agronomy.thresholds import (
-    NOT_EVALUATED,
-    get_rule,
-    has_age_specific_rules,
-)
+from app.services.agronomy.thresholds import NOT_EVALUATED, Threshold, get_rules_at
 
 #: Baisse relative à partir de laquelle une variation est significative
 SIGNIFICANT_DROP = 0.15   # 15 %
@@ -127,23 +125,24 @@ def compute_age_years(planting_date: date | None, at: date | None = None) -> flo
 
 
 def evaluate_indicators(
-    species: str,
-    stage: str,
+    thresholds: tuple[Threshold, ...],
     values: dict[str, float],
     previous: dict[str, float] | None = None,
-    age_years: float | None = None,
 ) -> list[Indicator]:
     """
-    Compare chaque indice suivi à ce stade avec son seuil, et calcule sa
+    Compare chaque indice suivi à cette date avec son seuil, et calcule sa
     variation depuis la mesure précédente.
 
-    Seuls les indices prévus pour ce stade sont retournés : en afficher
+    `thresholds` vient de thresholds.get_rules_at : les seuils de toutes
+    les règles du document qui s'appliquent à cette date et à cet âge.
+
+    Seuls les indices prévus à cette période sont retournés : en afficher
     quinze noierait l'information utile.
     """
     previous = previous or {}
     indicators: list[Indicator] = []
 
-    for threshold in get_rule(species, stage, age_years).thresholds:
+    for threshold in thresholds:
         value = values.get(threshold.indice)
         if value is None:
             continue
@@ -350,7 +349,8 @@ def diagnose(
     Returns:
         Diagnosis prêt à afficher ou à archiver.
     """
-    period = get_stage_at(species, scene_date, planting_date)
+    state = get_stages_at(species, scene_date, planting_date)
+    period = state.principal if state else None
     stage = period.stage if period else None
     spec = get_species(species)
     age = compute_age_years(planting_date, scene_date)
@@ -372,14 +372,17 @@ def diagnose(
         result.reading = "Espèce non référencée : aucune interprétation possible."
         return result
 
-    rule = get_rule(species, stage, age)
-    result.explanation = rule.explanation
-    result.recommendation = rule.recommendation
-    result.indicators = evaluate_indicators(species, stage, values, previous_values, age)
+    # Seuils : les règles du document qui couvrent cette date et cet âge
+    selection = get_rules_at(species, scene_date, age)
+    result.explanation = selection.explanation
+    result.recommendation = selection.recommendation
+    result.indicators = evaluate_indicators(
+        selection.thresholds, values, previous_values
+    )
 
-    # Seuils dépendants de l'âge mais date de plantation absente :
-    # on applique la tranche la plus large et on le signale.
-    result.age_required = age is None and has_age_specific_rules(species, stage)
+    # Seuils dépendants de l'âge mais date de plantation absente : la
+    # tranche aux seuils les plus bas est appliquée, et on le signale.
+    result.age_required = selection.age_required
 
     # Une baisse pendant une coupe ou une récolte n'est pas une anomalie
     result.cultural_drop = recent_harvest or is_cultural_period(species, scene_date, planting_date)
@@ -392,7 +395,7 @@ def diagnose(
         return result
 
     # Espèce caduque en repos : un indice bas est normal, pas un stress
-    if is_deciduous(species) and stage in ("dormance", "repos"):
+    if is_deciduous(species) and stage == "dormance":
         result.reading = (
             "Espèce à feuilles caduques en repos : des indices bas sont "
             "normaux à cette période."

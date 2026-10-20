@@ -142,6 +142,26 @@ def _launch_ingestion_tasks(parcel_id: int) -> None:
         logger.exception("Échec du lancement des tâches Celery")
 
 
+def _launch_history_task(parcel_id: int) -> None:
+    """
+    Lance la constitution de l'historique Sentinel-2 (3 ans) d'une parcelle
+    NOUVELLE, en tâche de fond sur le worker dédié. Différée de 5 minutes,
+    pour que l'image et les indices du jour arrivent d'abord.
+
+    Appelée à la création seulement : une modification de parcelle ne
+    relance pas 30 minutes de calcul. Si Celery ou Redis est indisponible,
+    la parcelle est créée quand même ; l'historique pourra être constitué
+    plus tard avec app/scripts/backfill_indices_history.py.
+    """
+    try:
+        from app.tasks.history_tasks import enqueue_history
+
+        if enqueue_history(parcel_id, countdown=300):
+            logger.info("Historique programmé pour parcel_id=%s", parcel_id)
+    except Exception:
+        logger.exception("Échec du lancement de l'historique (parcel_id=%s)", parcel_id)
+
+
 # ----------------------------------------------------------------------
 # GET /parcels — liste
 # ----------------------------------------------------------------------
@@ -227,9 +247,11 @@ def create_parcel(
     ).fetchone()
     db.commit()
 
-    # Lance les DEUX tâches (rasters + 14 indices), seulement si la parcelle est active
+    # Lance les DEUX tâches (rasters + 14 indices), seulement si la parcelle est active,
+    # puis l'historique de 3 ans, en tâche de fond sur le worker dédié
     if is_active:
         _launch_ingestion_tasks(row.id)
+        _launch_history_task(row.id)
 
     return ParcelResponse(
         id=row.id,

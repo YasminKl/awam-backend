@@ -437,7 +437,6 @@ def _search_best_scene(
     """
     candidates = _search_scene_candidates(bbox, lookback_days, max_cloud, limit=1)
     return candidates[0] if candidates else None
-
     
 
 # ----------------------------------------------------------------------
@@ -765,7 +764,6 @@ def generate_sentinel_composites_for_parcel(
     }
 
 
-
 # ======================================================================
 # INGESTION DES 14 INDICES SPECTRAUX
 # ======================================================================
@@ -965,6 +963,7 @@ def _insert_indice_readings(
     return inserted
 
 
+
 def generate_all_indices_for_parcel(
     db: Session,
     farm_id: int,
@@ -974,12 +973,18 @@ def generate_all_indices_for_parcel(
     *,
     force_refresh: bool = False,
     item=None,
+    write_cogs: bool = True,
 ) -> dict | None:
     """
     Génère les 14 indices spectraux pour une parcelle et insère les stats.
 
     `item` : scène imposée (recalcul de l'historique). Sans lui, la scène
     est choisie automatiquement, comme d'habitude.
+
+    `write_cogs` : False pour n'enregistrer que les valeurs, sans fabriquer
+    ni envoyer sur B2 les images cartographiques. Utilisé pour l'historique
+    de plusieurs années : la carte n'affiche que la dernière image, les
+    images anciennes ne serviraient qu'à occuper le stockage.
 
     La scène est choisie sur la part de PARCELLE visible (bande SCL), et
     non sur le taux de nuages de la scène entière : on obtient ainsi
@@ -1110,7 +1115,7 @@ def generate_all_indices_for_parcel(
     transform = ref_da.rio.transform()
     crs = ref_da.rio.crs
 
-    can_write_cogs = (
+    can_write_cogs = write_cogs and (
         all(n in indices_ok for n in SEPARATE_COGS)
         and all(n in indices_ok for n in MULTIBAND_ORDER.values())
     )
@@ -1129,6 +1134,8 @@ def generate_all_indices_for_parcel(
             logger.exception("[Indices] Échec écriture COG : %s", e)
             cog_paths = {}
             b2_keys = {}
+    elif not write_cogs:
+        logger.info("[Indices] Historique : valeurs seules, sans image cartographique")
     else:
         missing = [
             n for n in list(SEPARATE_COGS) + list(MULTIBAND_ORDER.values())

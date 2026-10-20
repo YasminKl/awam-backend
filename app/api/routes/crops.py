@@ -22,6 +22,9 @@ from app.models.parcel import Parcel
 from app.models.utilisateur import User
 from app.schemas.crop import (
     CropCreate,
+    ExpectedHarvestPreview,
+    check_crop_dates,
+    check_harvest,
     CropSuggestions,
     CropObservationCreate,
     CropObservationResponse,
@@ -30,7 +33,11 @@ from app.schemas.crop import (
     SpeciesOption,
     VarietyOption,
 )
-from app.services.agronomy.calendar import expected_harvest_date, get_stage_at
+from app.services.agronomy.calendar import (
+    expected_harvest_date,
+    get_stage_at,
+    next_harvest_after,
+)
 from app.services.agronomy.species import (
     ORIGIN_LABELS,
     SPECIES,
@@ -78,49 +85,144 @@ def _get_owned_crop(crop_id: int, user: User, db: Session) -> Crop:
     return crop
 
 
-def _sync_harvest_date(crop: Crop, db: Session) -> None:
-    """
-    Déduit la date de récolte réelle de la dernière activité de récolte.
-
-    Évite la double saisie : l'utilisateur enregistre la récolte comme
-    une intervention, la date remonte ici automatiquement. Une valeur
-    saisie à la main n'est jamais écrasée.
-    """
-    if crop.actual_harvest_date is not None:
-        return
-
-    last = (
+def _last_harvest_activity(crop: Crop, db: Session) -> Optional[date]:
+    """Date de la dernière activité de type récolte ou coupe, ou None."""
+    activities = (
         db.query(Activity)
         .filter(Activity.crop_id == crop.id)
         .order_by(Activity.performed_at.desc())
         .all()
     )
-    for activity in last:
+    for activity in activities:
         if (activity.activity_type or "").strip().lower() in HARVEST_TYPES:
-            crop.actual_harvest_date = activity.performed_at.date()
-            # Une récolte réelle prouve que le verger produit
+            return activity.performed_at.date()
+    return None
+
+
+def _sync_harvest_date(crop: Crop, db: Session) -> None:
+    """
+    Déduit la date de récolte réelle de la dernière activité de récolte.
+
+    Évite la double saisie : l'utilisateur enregistre la récolte comme
+    une intervention, la date remonte ici automatiquement.
+
+    La date suit la DERNIÈRE récolte, pas la première : une culture
+    coupée plusieurs fois dans la saison (menthe, géranium) ne doit pas
+    rester figée sur sa première coupe. Une valeur déjà en place n'est
+    remplacée que par une récolte postérieure, ce qui préserve une
+    saisie manuelle tant qu'aucune coupe plus récente n'est déclarée.
+
+    Le passage en statut « harvested » est réservé aux ANNUELLES : chez
+    une pérenne, la récolte ne termine pas la culture, elle ouvre le
+    cycle suivant. La plante reste en place, donc `active`.
+    """
+    harvested_on = _last_harvest_activity(crop, db)
+    if harvested_on is None:
+        return
+
+    if crop.actual_harvest_date is None or harvested_on > crop.actual_harvest_date:
+        crop.actual_harvest_date = harvested_on
+
+    # Une récolte réelle prouve que le verger produit
+    crop.in_production = True
+
+    if is_annual(crop.species) and crop.status == "active":
+        crop.status = "harvested"
+
+
+def _keep_perennial_active(crop: Crop) -> None:
+    """
+    Une PÉRENNE n'est jamais clôturée par une récolte : la plante reste en
+    place, la récolte ouvre le cycle suivant. Si le formulaire envoie le
+    statut « harvested » pour une pérenne, la récolte (date, quantité) est
+    gardée mais la culture reste `active`, exactement comme lorsqu'une
+    récolte est déduite d'une activité (_sync_harvest_date).
+    """
+    if crop.status == "harvested" and not is_annual(crop.species):
+        crop.status = "active"
+        # Une récolte réelle prouve que le verger produit (même règle que
+        # _sync_harvest_date)
+        if is_orchard(crop.species):
             crop.in_production = True
-            if crop.status == "active":
-                crop.status = "harvested"
-            return
 
 
 def _compute_expected_harvest(crop: Crop) -> None:
     """
     Remplit la date de récolte prévue depuis le calendrier agronomique.
 
-    Ne s'applique qu'aux cultures en cours, sans date saisie à la main.
+    Trois cas :
+      - culture abandonnée : jamais de récolte prévue ;
+      - ANNUELLE récoltée : le cycle est fini, la date n'est plus
+        recalculée ; seule la date réelle compte ;
+      - PÉRENNE : le cycle reboucle. Tant qu'aucune récolte réelle n'est
+        enregistrée, la date se calcule depuis la plantation. Dès qu'une
+        récolte a eu lieu, la prochaine se calcule À PARTIR D'ELLE, sans
+        repasser par la date de plantation.
+
     Pour un arbre fruitier pas encore en production, la date reste vide :
     le système ne devine pas l'année de première récolte.
     """
-    if crop.status != "active":
+    if crop.status == "abandoned":
+        crop.expected_harvest_date = None
         return
+
+    orchard = is_orchard(crop.species)
+
+    if is_annual(crop.species):
+        if crop.status != "active":
+            return
+        crop.expected_harvest_date = expected_harvest_date(
+            crop.species,
+            crop.planting_date,
+            orchard=orchard,
+            in_production=bool(crop.in_production),
+        )
+        return
+
+    # Pérenne : la récolte réelle devient le point de départ du cycle suivant
+    if crop.actual_harvest_date is not None:
+        if orchard and not crop.in_production:
+            crop.expected_harvest_date = None
+            return
+        crop.expected_harvest_date = next_harvest_after(
+            crop.species, crop.actual_harvest_date
+        )
+        return
+
     crop.expected_harvest_date = expected_harvest_date(
         crop.species,
         crop.planting_date,
-        orchard=is_orchard(crop.species),
+        orchard=orchard,
         in_production=bool(crop.in_production),
     )
+
+
+def _refresh_cycle(crop: Crop, db: Session) -> None:
+    """
+    Remet la culture à jour sur son cycle : récolte réelle déduite des
+    activités, puis récolte prévue recalculée. Appelé à chaque lecture,
+    pour que la récolte suivante d'une pérenne apparaisse sans action
+    manuelle.
+
+    Le recalcul n'a lieu que si la date prévue est devenue caduque,
+    c'est-à-dire absente ou antérieure à la récolte qui vient d'avoir
+    lieu. Une date future saisie à la main n'est donc jamais écrasée.
+    """
+    _sync_harvest_date(crop, db)
+
+    if crop.status == "abandoned":
+        return
+    if is_annual(crop.species):
+        return
+    if crop.actual_harvest_date is None:
+        return
+    if (
+        crop.expected_harvest_date is not None
+        and crop.expected_harvest_date > crop.actual_harvest_date
+    ):
+        return
+
+    _compute_expected_harvest(crop)
 
 
 def _to_response(crop: Crop) -> CropResponse:
@@ -134,9 +236,12 @@ def _to_response(crop: Crop) -> CropResponse:
         planting_date=crop.planting_date,
         expected_harvest_date=crop.expected_harvest_date,
         actual_harvest_date=crop.actual_harvest_date,
+        actual_yield=crop.actual_yield,
+        yield_unit=crop.yield_unit,
         density=crop.density,
         in_production=bool(crop.in_production),
         is_orchard=is_orchard(crop.species),
+        is_annual=is_annual(crop.species),
         status=crop.status,
         notes=crop.notes,
         created_at=crop.created_at,
@@ -169,6 +274,55 @@ def list_available_species():
         )
         for s in list_species()
     ]
+
+
+@router.get("/crops/expected-harvest", response_model=ExpectedHarvestPreview)
+def preview_expected_harvest(
+    species: str,
+    planting_date: date,
+    in_production: bool = False,
+    harvest_date: Optional[date] = None,
+    user: User = Depends(get_current_user),
+):
+    """
+    Récolte prévue pour une espèce et une date de plantation, AVANT
+    l'enregistrement : le formulaire l'affiche dès la saisie. Même calcul
+    que celui appliqué à l'enregistrement (_compute_expected_harvest).
+
+    Avec `harvest_date` (statut « Récoltée » dans le formulaire) :
+      - pérenne : la PROCHAINE récolte, calculée à partir de cette récolte ;
+      - annuelle : aucune, le cycle est terminé.
+    """
+    code = species.strip().lower()
+    if code not in SPECIES:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Espèce inconnue.")
+
+    orchard = is_orchard(code)
+
+    if harvest_date is not None:
+        if is_annual(code):
+            return ExpectedHarvestPreview(
+                expected_harvest_date=None,
+                reason="Culture annuelle : le cycle se termine avec la récolte.",
+            )
+        # Une récolte réelle prouve que le verger produit : la case
+        # « en production » sera cochée à l'enregistrement
+        return ExpectedHarvestPreview(
+            expected_harvest_date=next_harvest_after(code, harvest_date),
+            reason=None,
+        )
+
+    result = expected_harvest_date(
+        code, planting_date, orchard=orchard, in_production=in_production
+    )
+    reason = None
+    if result is None:
+        reason = (
+            "Verger pas encore en production : pas de récolte prévue."
+            if orchard and not in_production
+            else "Pas de période de récolte connue pour cette espèce."
+        )
+    return ExpectedHarvestPreview(expected_harvest_date=result, reason=reason)
 
 
 @router.get("/parcels/{parcel_id}/crop-suggestions", response_model=CropSuggestions)
@@ -227,7 +381,7 @@ def list_parcel_crops(
         .all()
     )
     for crop in crops:
-        _sync_harvest_date(crop, db)
+        _refresh_cycle(crop, db)
     db.commit()
     return [_to_response(c) for c in crops]
 
@@ -239,7 +393,7 @@ def get_crop(
     db: Session = Depends(get_db),
 ):
     crop = _get_owned_crop(crop_id, user, db)
-    _sync_harvest_date(crop, db)
+    _refresh_cycle(crop, db)
     db.commit()
     return _to_response(crop)
 
@@ -258,8 +412,12 @@ def create_crop(
     crop = Crop(**data)
     if not is_orchard(crop.species):
         crop.in_production = False
+    _keep_perennial_active(crop)
     if not manual_expected:
         _compute_expected_harvest(crop)
+    # Culture abandonnée : elle ne sera jamais récoltée
+    if crop.status == "abandoned":
+        crop.expected_harvest_date = None
 
     db.add(crop)
     db.commit()
@@ -280,14 +438,35 @@ def update_crop(
     for field, value in changes.items():
         setattr(crop, field, value)
 
-    # Une fois récoltée, seule la date réelle compte : la date prévue
-    # n'est plus recalculée ni modifiable.
-    if crop.status == "active" and "expected_harvest_date" not in changes:
-        if {"species", "planting_date", "in_production", "status"} & changes.keys():
-            _compute_expected_harvest(crop)
-
     if not is_orchard(crop.species):
         crop.in_production = False
+    _keep_perennial_active(crop)
+
+    # Recalcul de la récolte prévue, sauf si l'utilisateur vient de la
+    # saisir lui-même. Chez une pérenne, une nouvelle date de récolte
+    # réelle ouvre le cycle suivant : elle déclenche donc le recalcul.
+    if "expected_harvest_date" not in changes:
+        triggers = {
+            "species", "planting_date", "in_production",
+            "status", "actual_harvest_date",
+        }
+        if triggers & changes.keys():
+            _compute_expected_harvest(crop)
+
+    # Culture abandonnée : elle ne sera jamais récoltée
+    if crop.status == "abandoned":
+        crop.expected_harvest_date = None
+
+    # Cohérence sur l'état FINAL de la culture, après le recalcul de la
+    # récolte prévue : une modification partielle doit rester compatible
+    # avec ce qui est déjà enregistré. Une culture récoltée doit porter sa
+    # date et sa production réelles.
+    try:
+        check_crop_dates(crop.planting_date, crop.expected_harvest_date, crop.actual_harvest_date)
+        check_harvest(crop.status, crop.actual_harvest_date, crop.actual_yield, crop.yield_unit)
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
 
     db.commit()
     db.refresh(crop)

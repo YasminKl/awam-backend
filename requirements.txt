@@ -127,3 +127,5 @@ resend
 boto3==1.35.*
 python-multipart
 cloudinary
+planetary-computer
+pystac-client

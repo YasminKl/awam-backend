@@ -15,6 +15,24 @@ L'ÂGE est déterminant pour les pérennes : un jeune olivier couvre peu de
 sol, son NDVI est structurellement bas sans que ce soit un problème. Le
 document décline donc les seuils par tranche d'âge là où c'est pertinent.
 
+PÉRIODE DE CHAQUE RÈGLE — le document donne, pour chaque règle, sa
+propre « période indicative » (feuille « combinaison stade pheno age et
+indice »). C'est ELLE qui décide quand la règle s'applique, et non le
+calendrier des stades (calendar.py). Les deux tableaux du document ne
+découpent pas l'année de la même façon : le romarin y est en récolte
+d'avril à octobre, mais sa croissance se surveille jusqu'en mai. Choisir
+la règle par le stade faisait disparaître la règle de croissance dès
+avril ; la choisir par sa période suit exactement le document.
+
+Quand plusieurs règles couvrent le même mois (la menthe en mai : fin de
+croissance et début de l'avant-récolte), elles s'appliquent TOUTES : le
+document y surveille les deux indices.
+
+Chaque règle correspond à UNE ligne du document : même indice, même
+seuil, même période, même âge. Les tranches d'âge absentes du document
+ne sont pas inventées : à ces âges, la surveillance générale de l'eau
+(DEFAULT_RULE) s'applique.
+
 ⚠️  Ces seuils sont des RÉFÉRENCES DU PROJET, non des valeurs publiées.
     Ils doivent être calibrés sur les observations terrain au fil des
     saisons. Le moteur de diagnostic s'appuie également sur la VARIATION
@@ -24,6 +42,7 @@ document décline donc les seuils par tranche d'âge là où c'est pertinent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 
 
 @dataclass(frozen=True)
@@ -77,6 +96,16 @@ class StageRule:
     Règle complète d'un stade : les indices à surveiller, l'explication
     agronomique et la recommandation, toutes deux issues du document.
 
+    `months` : la « période indicative » du document, en mois (1 =
+    janvier). C'est elle qui décide quand la règle s'applique.
+
+    `doc_stage` : le stade tel qu'il est nommé dans le document (« Pré-
+    récolte », « Avant récolte »...). Les tranches d'âge d'une même ligne
+    partagent le même `doc_stage`.
+
+    `stage` : le stade correspondant dans la nomenclature du calendrier,
+    conservé pour la traçabilité.
+
     `age_min` / `age_max` en années : la règle ne s'applique qu'aux
     plantes de cette tranche. None = tous âges.
     """
@@ -87,6 +116,15 @@ class StageRule:
     recommendation: str = ""
     age_min: float | None = None
     age_max: float | None = None
+    months: tuple[int, ...] = ()
+    doc_stage: str = ""
+
+    def covers(self, month: int) -> bool:
+        return month in self.months
+
+    @property
+    def has_age_bounds(self) -> bool:
+        return self.age_min is not None or self.age_max is not None
 
     def matches_age(self, age_years: float | None) -> bool:
         """Vrai si la règle s'applique à cet âge (ou si l'âge est inconnu)."""
@@ -139,6 +177,15 @@ NOT_EVALUATED: dict[str, str] = {
 }
 
 
+#: Mois, pour lire les périodes ci-dessous
+JAN, FEV, MAR, AVR, MAI, JUN, JUL, AOU, SEP, OCT, NOV, DEC = range(1, 13)
+
+
+def _months(start: int, end: int) -> tuple[int, ...]:
+    """Mois de `start` à `end` inclus (sans passage d'année ici)."""
+    return tuple(range(start, end + 1))
+
+
 RULES: dict[str, tuple[StageRule, ...]] = {
 
     # ==================================================================
@@ -146,7 +193,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "olivier": (
         StageRule(
-            stage="debourrement", age_min=0, age_max=3,
+            stage="debourrement", doc_stage="Débourrement",
+            months=_months(MAR, AVR), age_min=0, age_max=3,
             thresholds=(
                 Threshold("NDVI", 0.30, 0.50),
                 Threshold("SAVI", 0.25, 0.45),
@@ -156,7 +204,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Vérifier irrigation, mortalité et fertilisation azotée.",
         ),
         StageRule(
-            stage="debourrement", age_min=3, age_max=10,
+            stage="debourrement", doc_stage="Débourrement",
+            months=_months(MAR, AVR), age_min=3, age_max=10,
             thresholds=(
                 Threshold("NDVI", 0.35, 0.60),
                 Threshold("FCOVER", 45, 65, unit="%"),
@@ -165,7 +214,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Contrôler la croissance annuelle.",
         ),
         StageRule(
-            stage="debourrement", age_min=10,
+            stage="debourrement", doc_stage="Débourrement",
+            months=_months(MAR, AVR), age_min=10,
             thresholds=(
                 Threshold("NDVI", 0.45, 0.70),
                 Threshold("FCOVER", 65, 85, unit="%"),
@@ -174,7 +224,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Comparer avec les années précédentes.",
         ),
         StageRule(
-            stage="floraison",
+            stage="floraison", doc_stage="Floraison",
+            months=_months(AVR, MAI),
             thresholds=(
                 Threshold("NDRE", 0.20, 0.35),
                 Threshold("FCOVER", 60, 80, unit="%"),
@@ -183,7 +234,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Vérifier la nutrition azotée et l'irrigation.",
         ),
         StageRule(
-            stage="nouaison",
+            stage="nouaison", doc_stage="Nouaison-Grossissement",
+            months=_months(MAI, SEP),
             thresholds=(
                 Threshold("NDMI", 0.15, 0.35),
                 Threshold("MSI", 1.00, 1.30, inverted=True),
@@ -193,7 +245,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Ajuster l'irrigation selon l'ET₀.",
         ),
         StageRule(
-            stage="maturation",
+            stage="maturation", doc_stage="Maturation",
+            months=_months(SEP, NOV),
             thresholds=(
                 Threshold("MSI", 1.00, 1.30, inverted=True),
                 Threshold("NDVI", 0.45, 0.70),
@@ -203,30 +256,29 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Optimiser la date de récolte.",
         ),
     ),
-        # ==================================================================
+
+    # ==================================================================
     # AMANDIER — caduc : NDVI bas en hiver est normal
+    # Le document ne donne le débourrement que pour 0–3 ans.
     # ==================================================================
     "amandier": (
         StageRule(
-            stage="debourrement", age_min=0, age_max=3,
+            stage="debourrement", doc_stage="Débourrement",
+            months=_months(JAN, FEV), age_min=0, age_max=3,
             thresholds=(Threshold("NDVI", 0.30, 0.50),),
             explanation="Début de croissance printanière après défoliation hivernale.",
             recommendation="Vérifier la reprise végétative.",
         ),
         StageRule(
-            stage="debourrement", age_min=3,
-            thresholds=(Threshold("NDVI", 0.35, 0.60),),
-            explanation="Reprise d'un verger établi après défoliation hivernale.",
-            recommendation="Vérifier la reprise végétative.",
-        ),
-        StageRule(
-            stage="floraison",
+            stage="floraison", doc_stage="Floraison",
+            months=_months(FEV, MAR),
             thresholds=(Threshold("NDRE", 0.20, 0.35),),
             explanation="Floraison sensible aux stress climatiques, notamment au gel.",
             recommendation="Contrôler la nutrition et l'humidité.",
         ),
         StageRule(
-            stage="grossissement",
+            stage="developpement", doc_stage="Grossissement",
+            months=_months(AVR, JUN),
             thresholds=(
                 Threshold("NDMI", 0.15, 0.35),
                 Threshold("MSI", 1.00, 1.30, inverted=True),
@@ -238,10 +290,12 @@ RULES: dict[str, tuple[StageRule, ...]] = {
 
     # ==================================================================
     # CAROUBIER
+    # Le document donne la croissance pour 0–5 ans, les gousses au-delà.
     # ==================================================================
     "caroubier": (
         StageRule(
-            stage="croissance", age_min=0, age_max=5,
+            stage="croissance", doc_stage="Croissance végétative",
+            months=_months(MAR, MAI), age_min=0, age_max=5,
             thresholds=(
                 Threshold("NDVI", 0.35, 0.60),
                 Threshold("FCOVER", 30, 50, unit="%"),
@@ -250,16 +304,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Vérifier l'installation.",
         ),
         StageRule(
-            stage="croissance", age_min=5,
-            thresholds=(
-                Threshold("NDVI", 0.40, 0.65),
-                Threshold("FCOVER", 55, 75, unit="%"),
-            ),
-            explanation="Couronne établie.",
-            recommendation="Comparer avec les arbres de même âge.",
-        ),
-        StageRule(
-            stage="formation_gousses",
+            stage="developpement", doc_stage="Développement des gousses",
+            months=_months(JUN, SEP), age_min=5,
             thresholds=(
                 Threshold("NDMI", 0.15, 0.35),
                 Threshold("FCOVER", 60, 80, unit="%"),
@@ -271,10 +317,12 @@ RULES: dict[str, tuple[StageRule, ...]] = {
 
     # ==================================================================
     # ROMARIN
+    # Croissance active pour 0–1 an, pré-récolte au-delà d'1 an.
     # ==================================================================
     "romarin": (
         StageRule(
-            stage="croissance", age_min=0, age_max=1,
+            stage="croissance", doc_stage="Croissance active",
+            months=_months(FEV, MAI), age_min=0, age_max=1,
             thresholds=(
                 Threshold("NDVI", 0.30, 0.55),
                 Threshold("SAVI", 0.25, 0.50),
@@ -284,17 +332,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Fertilisation légère et irrigation.",
         ),
         StageRule(
-            stage="croissance", age_min=1,
-            thresholds=(
-                Threshold("NDVI", 0.35, 0.60),
-                Threshold("SAVI", 0.30, 0.55),
-                Threshold("FCOVER", 50, 80, unit="%"),
-            ),
-            explanation="Production de biomasse sur plantation établie.",
-            recommendation="Fertilisation légère et irrigation.",
-        ),
-        StageRule(
-            stage="pre_recolte",
+            stage="recolte", doc_stage="Pré-récolte",
+            months=_months(JUN, JUL), age_min=1,
             thresholds=(
                 Threshold("NDMI", 0.15, 0.35),
                 Threshold("FCOVER", 65, 90, unit="%"),
@@ -306,10 +345,12 @@ RULES: dict[str, tuple[StageRule, ...]] = {
 
     # ==================================================================
     # LAVANDE
+    # Reprise végétative pour 0–1 an, floraison au-delà d'1 an.
     # ==================================================================
     "lavande": (
         StageRule(
-            stage="reprise", age_min=0, age_max=1,
+            stage="debourrement", doc_stage="Reprise végétative",
+            months=_months(FEV, MAR), age_min=0, age_max=1,
             thresholds=(
                 Threshold("NDVI", 0.30, 0.55),
                 Threshold("FCOVER", 25, 45, unit="%"),
@@ -318,16 +359,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Vérifier l'homogénéité des plants.",
         ),
         StageRule(
-            stage="reprise", age_min=1,
-            thresholds=(
-                Threshold("NDVI", 0.35, 0.60),
-                Threshold("FCOVER", 45, 75, unit="%"),
-            ),
-            explanation="Développement végétatif sur plantation établie.",
-            recommendation="Vérifier l'homogénéité des plants.",
-        ),
-        StageRule(
-            stage="floraison",
+            stage="floraison", doc_stage="Floraison",
+            months=_months(MAI, JUL), age_min=1,
             thresholds=(
                 Threshold("NDRE", 0.20, 0.35),
                 Threshold("FCOVER", 60, 85, unit="%"),
@@ -342,7 +375,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "sauge": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance",
+            months=_months(MAR, MAI),
             thresholds=(
                 Threshold("NDVI", 0.30, 0.55),
                 Threshold("FCOVER", 50, 75, unit="%"),
@@ -351,7 +385,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Vérifier l'irrigation.",
         ),
         StageRule(
-            stage="pre_recolte",
+            stage="recolte", doc_stage="Pré-récolte",
+            months=(JUN,),
             thresholds=(
                 Threshold("NDMI", 0.15, 0.35),
                 Threshold("FCOVER", 65, 85, unit="%"),
@@ -366,7 +401,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "menthe": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance rapide",
+            months=_months(MAR, JUN),
             thresholds=(
                 Threshold("NDVI", 0.40, 0.70),
                 Threshold("FCOVER", 75, 95, unit="%"),
@@ -375,7 +411,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Irrigation fréquente.",
         ),
         StageRule(
-            stage="pre_recolte",
+            stage="recolte", doc_stage="Avant récolte",
+            months=_months(MAI, OCT),
             thresholds=(
                 Threshold("NDMI", 0.20, 0.40),
                 Threshold("FCOVER", 85, 98, unit="%"),
@@ -384,12 +421,14 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Maintenir une humidité élevée.",
         ),
     ),
-        # ==================================================================
+
+    # ==================================================================
     # GÉRANIUM ROSAT
     # ==================================================================
     "geranium": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance",
+            months=_months(MAR, SEP),
             thresholds=(
                 Threshold("NDVI", 0.35, 0.60),
                 Threshold("FCOVER", 70, 95, unit="%"),
@@ -404,7 +443,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "verveine": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance",
+            months=_months(MAR, AOU),
             thresholds=(Threshold("NDVI", 0.35, 0.60),),
             explanation="Développement foliaire.",
             recommendation="Contrôle de la biomasse.",
@@ -416,13 +456,15 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "citronnelle": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance",
+            months=_months(AVR, SEP),
             thresholds=(Threshold("NDVI", 0.40, 0.70),),
             explanation="Forte production foliaire.",
             recommendation="Irrigation régulière.",
         ),
         StageRule(
-            stage="pre_recolte",
+            stage="recolte", doc_stage="Avant récolte",
+            months=_months(JUN, OCT),
             thresholds=(Threshold("NDMI", 0.20, 0.40),),
             explanation="L'état hydrique conditionne la teneur en huile essentielle.",
             recommendation="Éviter tout déficit hydrique.",
@@ -434,13 +476,15 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "basilic": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance",
+            months=_months(AVR, JUL),
             thresholds=(Threshold("NDVI", 0.45, 0.75),),
             explanation="Croissance rapide et forte biomasse.",
             recommendation="Fertilisation azotée modérée.",
         ),
         StageRule(
-            stage="pre_recolte",
+            stage="recolte", doc_stage="Avant récolte",
+            months=_months(JUN, SEP),
             thresholds=(Threshold("NDMI", 0.25, 0.45),),
             explanation="Une bonne humidité améliore la qualité des feuilles.",
             recommendation="Irrigation avant récolte.",
@@ -452,7 +496,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
     # ==================================================================
     "thym": (
         StageRule(
-            stage="croissance",
+            stage="croissance", doc_stage="Croissance active",
+            months=_months(MAR, MAI),
             thresholds=(
                 Threshold("NDVI", 0.40, 0.60),
                 Threshold("SAVI", 0.35, 0.55),
@@ -462,7 +507,8 @@ RULES: dict[str, tuple[StageRule, ...]] = {
             recommendation="Contrôler le couvert végétal.",
         ),
         StageRule(
-            stage="prefloraison",
+            stage="floraison", doc_stage="Pré-floraison",
+            months=_months(AVR, MAI),
             thresholds=(
                 Threshold("NDRE", 0.20, 0.35),
                 Threshold("FCOVER", 60, 80, unit="%"),
@@ -501,6 +547,91 @@ def get_rule(species: str, stage: str, age_years: float | None = None) -> StageR
 
     # Âge inconnu : la tranche la plus large (seuils les plus bas)
     return min(for_stage, key=lambda r: r.thresholds[0].low)
+
+
+@dataclass(frozen=True)
+class RuleSelection:
+    """
+    Règles applicables à une date, et ce qu'il faut en afficher.
+
+    `rules` : une ou plusieurs règles du document (plusieurs quand leurs
+    périodes se chevauchent), ou DEFAULT_RULE si aucune ne couvre la date.
+    `age_required` : vrai si une règle retenue dépend de l'âge alors que
+    la date de plantation est inconnue.
+    """
+
+    rules: tuple[StageRule, ...]
+    age_required: bool = False
+
+    @property
+    def thresholds(self) -> tuple[Threshold, ...]:
+        """Seuils de toutes les règles, un seul par indice (le premier)."""
+        seen: set[str] = set()
+        merged: list[Threshold] = []
+        for rule in self.rules:
+            for threshold in rule.thresholds:
+                if threshold.indice not in seen:
+                    seen.add(threshold.indice)
+                    merged.append(threshold)
+        return tuple(merged)
+
+    @property
+    def explanation(self) -> str:
+        return " ".join(dict.fromkeys(r.explanation for r in self.rules if r.explanation))
+
+    @property
+    def recommendation(self) -> str:
+        return " ".join(dict.fromkeys(r.recommendation for r in self.rules if r.recommendation))
+
+    @property
+    def is_default(self) -> bool:
+        return self.rules == (DEFAULT_RULE,)
+
+
+def get_rules_at(
+    species: str,
+    when: date,
+    age_years: float | None = None,
+) -> RuleSelection:
+    """
+    Règles applicables à une culture, à une date et à un âge donnés.
+
+    Une règle s'applique si la date tombe dans SA période, celle du
+    document, et si l'âge correspond à sa tranche. Plusieurs règles peuvent
+    s'appliquer ensemble : leurs indices sont alors tous surveillés.
+
+    Âge inconnu (date de plantation absente) : pour une ligne déclinée en
+    tranches d'âge, on retient la tranche aux seuils les plus bas, pour ne
+    pas alerter à tort ; pour une règle limitée à un âge, on l'applique
+    quand même. Dans les deux cas `age_required` le signale.
+    """
+    rules = RULES.get(species.lower()) or ()
+    covering = [r for r in rules if r.covers(when.month)]
+    if not covering:
+        return RuleSelection((DEFAULT_RULE,))
+
+    # Une ligne du document = un doc_stage, éventuellement en plusieurs tranches
+    by_line: dict[str, list[StageRule]] = {}
+    for rule in covering:
+        by_line.setdefault(rule.doc_stage or rule.stage, []).append(rule)
+
+    selected: list[StageRule] = []
+    age_required = False
+    for tranches in by_line.values():
+        if age_years is not None:
+            selected += [r for r in tranches if r.matches_age(age_years)]
+            continue
+        if any(r.has_age_bounds for r in tranches):
+            age_required = True
+        if len(tranches) == 1:
+            selected.append(tranches[0])
+        else:
+            selected.append(min(tranches, key=lambda r: r.thresholds[0].low))
+
+    if not selected:
+        # Âge connu mais hors des tranches du document : surveillance générale
+        return RuleSelection((DEFAULT_RULE,), age_required)
+    return RuleSelection(tuple(selected), age_required)
 
 
 def get_thresholds(species: str, stage: str, age_years: float | None = None):
