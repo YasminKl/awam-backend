@@ -5,7 +5,15 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from app.services.agronomy.species import SPECIES
 
-CropStatus = Literal["active", "harvested", "abandoned"]
+#: active    : en place, dans son cycle
+#: harvested : annuelle récoltée, cycle terminé (une pérenne reste active)
+#: abandoned : culture qui a échoué avant terme
+#: ended     : pérenne arrivée en fin de vie et arrachée, avec end_date
+CropStatus = Literal["active", "harvested", "abandoned", "ended"]
+
+#: Statuts qui clôturent une culture : plus de récolte, plus de diagnostic,
+#: et l'espèce est libérée pour une nouvelle plantation sur la parcelle
+CLOSED_STATUSES = ("abandoned", "ended")
 #: Unité de la production réelle
 YieldUnit = Literal["kg", "t"]
 
@@ -53,6 +61,27 @@ def check_harvest(
         raise ValueError("Indiquez l'unité de la production (kg ou t).")
 
 
+def check_end(
+    status: Optional[str],
+    planting_date: Optional[date],
+    end_date: Optional[date],
+    today: Optional[date] = None,
+) -> None:
+    """
+    Une culture « Terminée » porte sa date de fin (arrachage) : pas dans le
+    futur, et pas avant la plantation.
+    """
+    if status != "ended":
+        return
+    today = today or date.today()
+    if end_date is None:
+        raise ValueError("Indiquez la date de fin de la culture.")
+    if end_date > today:
+        raise ValueError("La date de fin ne peut pas être dans le futur.")
+    if planting_date and end_date < planting_date:
+        raise ValueError("La date de fin ne peut pas précéder la plantation.")
+
+
 class CropBase(BaseModel):
     species: str
     variety: Optional[str] = None
@@ -66,6 +95,8 @@ class CropBase(BaseModel):
     #: Arbres fruitiers : le verger produit-il déjà ?
     in_production: bool = False
     notes: Optional[str] = None
+    #: Date de fin, pour une culture « Terminée »
+    end_date: Optional[date] = None
 
     @field_validator("species")
     @classmethod
@@ -108,6 +139,7 @@ class CropCreate(CropBase):
     def dates_coherent(self) -> "CropCreate":
         check_crop_dates(self.planting_date, self.expected_harvest_date, self.actual_harvest_date)
         check_harvest(self.status, self.actual_harvest_date, self.actual_yield, self.yield_unit)
+        check_end(self.status, self.planting_date, self.end_date)
         return self
 
 
@@ -125,6 +157,7 @@ class CropUpdate(BaseModel):
     in_production: Optional[bool] = None
     status: Optional[CropStatus] = None
     notes: Optional[str] = None
+    end_date: Optional[date] = None
 
     @model_validator(mode="after")
     def planting_not_erased(self) -> "CropUpdate":
@@ -157,6 +190,8 @@ class CropResponse(CropBase):
     id: int
     parcel_id: int
     status: CropStatus
+    #: Date de fin, pour une culture « Terminée »
+    end_date: Optional[date] = None
     #: Libellé lisible de l'espèce, pour éviter au front de le deviner
     species_label: Optional[str] = None
     #: Vrai pour olivier, amandier, caroubier : le front affiche alors
@@ -166,6 +201,13 @@ class CropResponse(CropBase):
     #: pérenne récoltée en ouvre un nouveau (le front affiche « Récoltée »
     #: le jour de la récolte seulement)
     is_annual: bool = False
+    #: Âge de la plantation en années (depuis la date de plantation)
+    age_years: Optional[float] = None
+    #: Production optimale de l'espèce, ex. « de 3 à 6 ans »
+    optimal_production: Optional[str] = None
+    #: Message selon l'âge : niveau "info" ou "warning", et texte
+    lifespan_level: Optional[str] = None
+    lifespan_note: Optional[str] = None
     created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}

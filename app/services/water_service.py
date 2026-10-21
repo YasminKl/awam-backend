@@ -22,7 +22,7 @@ from datetime import date, timedelta
 
 import httpx
 
-from app.services.agronomy.water import get_kc
+from app.services.agronomy.water import get_kc_for_stages
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ async def fetch_water_balance(
 
 def compute_water_need(
     species: str,
-    stage: str,
+    stage,
     et0_mm: float,
     rain_mm: float,
     area_ha: float | None = None,
@@ -103,10 +103,14 @@ def compute_water_need(
     """
     Bilan hydrique à partir de l'ET0 et de la pluie mesurées.
 
+    `stage` : un stade, ou TOUS les stades actifs à cette date
+    (calendar.get_stages_at().codes). Avec plusieurs stades, le Kc le plus
+    élevé est retenu (voir water.get_kc_for_stages).
+
     Sans Kc connu pour l'espèce, le besoin n'est pas calculé : mieux vaut
     ne rien afficher qu'une quantité d'eau fausse.
     """
-    kc = get_kc(species, stage)
+    kc = get_kc_for_stages(species, stage)
 
     if kc is None:
         return WaterNeed(
@@ -145,7 +149,7 @@ def compute_water_need(
 
 async def get_water_need(
     species: str,
-    stage: str,
+    stage,
     latitude: float,
     longitude: float,
     area_ha: float | None = None,

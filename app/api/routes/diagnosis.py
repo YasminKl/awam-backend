@@ -30,8 +30,8 @@ from app.schemas.diagnosis import (
     StageTimelineItem,
     WaterNeedResponse,
 )
-from app.services.agronomy.calendar import get_periods, get_stage_at
-from app.services.agronomy.species import stage_label
+from app.services.agronomy.calendar import get_periods, get_stage_at, get_stages_at
+from app.services.agronomy.species import is_annual, stage_label
 from app.services.agronomy.water import evaluate_soil
 from app.services.crop_monitoring import archive_diagnosis, run_diagnosis
 from app.services.water_service import get_water_need
@@ -61,6 +61,30 @@ def _get_owned_crop(crop_id: int, user: User, db: Session) -> Crop:
 # ----------------------------------------------------------------------
 
 
+def _fmt(d: date | None) -> str:
+    return d.strftime("%d/%m/%Y") if d else "—"
+
+
+def _closed_reason(crop: Crop) -> str | None:
+    """
+    Raison pour laquelle une culture n'est plus suivie, ou None si elle est
+    en place. Une culture clôturée n'a plus de diagnostic, plus de stade
+    courant et plus de besoin en eau : la plante n'est plus sur la parcelle
+    ou son cycle est fini. Même règle que le diagnostic automatique
+    (crop_monitoring), qui ne traite que les cultures « active ».
+    """
+    if crop.status == "ended":
+        return f"Culture terminée le {_fmt(crop.end_date)} : plus de suivi satellite."
+    if crop.status == "abandoned":
+        return "Culture abandonnée : plus de suivi satellite."
+    if crop.status == "harvested" and is_annual(crop.species):
+        return (
+            f"Culture annuelle récoltée le {_fmt(crop.actual_harvest_date)} : "
+            "cycle terminé, plus de suivi satellite."
+        )
+    return None
+
+
 @router.get("/crops/{crop_id}/diagnosis", response_model=DiagnosisResponse)
 def get_crop_diagnosis(
     crop_id: int,
@@ -76,6 +100,16 @@ def get_crop_diagnosis(
     prochaine anomalie et à l'historique de la saison.
     """
     crop = _get_owned_crop(crop_id, user, db)
+
+    # Culture clôturée : ni diagnostic, ni archivage
+    closed = _closed_reason(crop)
+    if closed:
+        return DiagnosisResponse(
+            crop_id=crop_id,
+            stage=StageInfo(stage=None, label="Suivi terminé"),
+            reading=closed,
+            severity="normal",
+        )
 
     result, scene = run_diagnosis(db, crop)
     archive_diagnosis(db, crop, result, scene)
@@ -131,7 +165,8 @@ def get_crop_stages(
 
     today = date.today()
     current = get_stage_at(crop.species, today, crop.planting_date)
-    current_stage = current.stage if current else None
+    # Culture clôturée : la frise reste consultable, sans stade courant
+    current_stage = current.stage if current and not _closed_reason(crop) else None
 
     return [
         StageTimelineItem(
@@ -163,6 +198,14 @@ async def get_crop_needs(
     """
     crop = _get_owned_crop(crop_id, user, db)
 
+    # Culture clôturée : aucune irrigation ni fertilisation à conseiller
+    closed = _closed_reason(crop)
+    if closed:
+        return NeedsResponse(
+            crop_id=crop_id,
+            closed_reason=closed.replace("plus de suivi satellite", "aucun besoin en eau ni en fertilisation"),
+        )
+
     row = db.execute(
         text("""
             SELECT f.latitude, f.longitude,
@@ -173,14 +216,16 @@ async def get_crop_needs(
         {"pid": crop.parcel_id},
     ).fetchone()
 
-    period = get_stage_at(crop.species, date.today(), crop.planting_date)
-    stage = period.stage if period else ""
+    # Tous les stades actifs aujourd'hui : le Kc retenu est le plus élevé
+    # (voir water.get_kc_for_stages), et non celui du seul stade principal
+    state = get_stages_at(crop.species, date.today(), crop.planting_date)
+    stages = state.codes if state else ()
 
     # --- Irrigation ---------------------------------------------------
     water = None
     if row and row.latitude is not None and row.longitude is not None:
         need = await get_water_need(
-            species=crop.species, stage=stage,
+            species=crop.species, stage=stages,
             latitude=row.latitude, longitude=row.longitude,
             area_ha=row.area_ha,
         )

@@ -5,7 +5,10 @@ Une espèce porte son type (pérenne ou annuelle) et la liste ordonnée de
 ses stades. C'est le point d'entrée du référentiel : calendrier, seuils,
 Kc et références de sol sont tous indexés sur ces codes.
 
-Les stades suivent la nomenclature du document agronomique AWAM.
+Les stades suivent la nomenclature à NEUF stades du document agronomique
+AWAM (voir calendar.py). La liste `stages` de chaque espèce reprend, dans
+l'ordre, les stades de son calendrier : le script de vérification
+(app/scripts/check_harvest_cycle.py) contrôle qu'elles restent identiques.
 """
 
 from __future__ import annotations
@@ -47,84 +50,100 @@ SPECIES: dict[str, SpeciesSpec] = {
     "olivier": SpeciesSpec(
         code="olivier", label="Olivier", crop_type=CropType.PERENNIAL,
         orchard=True,
-        stages=("repos", "debourrement", "floraison", "nouaison",
-                "maturation", "recolte"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "nouaison", "developpement", "maturation", "recolte"),
     ),
     "amandier": SpeciesSpec(
         code="amandier", label="Amandier", crop_type=CropType.PERENNIAL,
         deciduous=True, orchard=True,
-        stages=("dormance", "debourrement", "floraison", "grossissement",
-                "maturation", "recolte", "post_recolte"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "nouaison", "developpement", "maturation", "recolte",
+                "apres_recolte"),
     ),
     "caroubier": SpeciesSpec(
         code="caroubier", label="Caroubier", crop_type=CropType.PERENNIAL,
         orchard=True,
-        stages=("repos", "croissance", "floraison", "formation_gousses",
-                "maturation", "recolte"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "nouaison", "developpement", "maturation", "recolte",
+                "apres_recolte"),
     ),
 
     # ---------------- Plantes aromatiques et médicinales ----------------
     "romarin": SpeciesSpec(
         code="romarin", label="Romarin", crop_type=CropType.PERENNIAL,
-        stages=("repos", "croissance", "floraison", "pre_recolte",
-                "recolte", "reprise_coupe"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "recolte"),
     ),
     "lavande": SpeciesSpec(
         code="lavande", label="Lavande", crop_type=CropType.PERENNIAL,
-        stages=("repos", "reprise", "floraison", "recolte", "reprise_coupe"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "maturation", "recolte", "apres_recolte"),
     ),
     "sauge": SpeciesSpec(
         code="sauge", label="Sauge officinale", crop_type=CropType.PERENNIAL,
-        stages=("repos", "croissance", "floraison", "pre_recolte",
-                "recolte", "reprise_coupe"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "maturation", "recolte", "apres_recolte"),
     ),
     "menthe": SpeciesSpec(
         code="menthe", label="Menthe", crop_type=CropType.PERENNIAL,
-        stages=("repos", "croissance", "pre_recolte", "recolte"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "recolte"),
     ),
     "geranium": SpeciesSpec(
         code="geranium", label="Géranium rosat", crop_type=CropType.PERENNIAL,
-        stages=("repos", "croissance", "recolte", "reprise_coupe"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "recolte", "apres_recolte"),
     ),
     "verveine": SpeciesSpec(
         code="verveine", label="Verveine odorante", crop_type=CropType.PERENNIAL,
         deciduous=True,
-        stages=("repos", "croissance", "floraison", "recolte", "reprise_coupe"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "maturation", "recolte", "apres_recolte"),
     ),
     "citronnelle": SpeciesSpec(
         code="citronnelle", label="Citronnelle", crop_type=CropType.PERENNIAL,
-        stages=("ralentissement", "croissance", "pre_recolte", "recolte"),
+        stages=("dormance", "debourrement", "croissance", "developpement",
+                "floraison", "maturation", "recolte"),
     ),
     "thym": SpeciesSpec(
         code="thym", label="Thym", crop_type=CropType.PERENNIAL,
-        stages=("repos", "croissance", "prefloraison", "floraison",
-                "recolte", "reprise_coupe"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "nouaison", "developpement", "maturation", "recolte",
+                "apres_recolte"),
     ),
 
     # ---------------- Cultures annuelles ----------------
     "basilic": SpeciesSpec(
         code="basilic", label="Basilic", crop_type=CropType.ANNUAL,
-        stages=("semis", "croissance", "pre_recolte", "recolte", "fin_cycle"),
+        stages=("dormance", "debourrement", "croissance", "floraison",
+                "nouaison", "developpement", "maturation", "recolte",
+                "apres_recolte"),
     ),
 }
 
 
 #: Libellés lisibles des stades, partagés par toutes les espèces
 STAGE_LABELS: dict[str, str] = {
-    "repos": "Repos hivernal",
+    # Les neuf stades du document AWAM
     "dormance": "Dormance",
-    "ralentissement": "Ralentissement",
     "debourrement": "Débourrement",
-    "reprise": "Reprise végétative",
     "croissance": "Croissance active",
-    "prefloraison": "Pré-floraison",
     "floraison": "Floraison",
     "nouaison": "Nouaison et grossissement",
+    "developpement": "Développement",
+    "maturation": "Maturation",
+    "recolte": "Récolte",
+    "apres_recolte": "Après récolte",
+    # Anciens codes, remplacés par les neuf stades : conservés UNIQUEMENT
+    # pour afficher correctement les observations de terrain enregistrées
+    # avant ce changement (le stade y est figé au moment de la saisie).
+    "repos": "Repos hivernal",
+    "ralentissement": "Ralentissement",
+    "reprise": "Reprise végétative",
+    "prefloraison": "Pré-floraison",
     "formation_gousses": "Développement des gousses",
     "grossissement": "Grossissement du fruit",
-    "maturation": "Maturation",
     "pre_recolte": "Pré-récolte",
-    "recolte": "Récolte",
     "post_recolte": "Après récolte",
     "reprise_coupe": "Reprise après coupe",
     "semis": "Semis ou plantation",
@@ -322,8 +341,7 @@ def parse_cultures(text: str | None) -> tuple[list[str], list[str]]:
             unknown.append(part)
     return found, unknown
 
-
-
+    
 
 # ======================================================================
 # Délai entre la plantation (plants repiqués) et la PREMIÈRE récolte
@@ -419,3 +437,120 @@ FIRST_HARVEST_DELAYS: dict[str, FirstHarvestDelay] = {
 def first_harvest_delay(code: str) -> FirstHarvestDelay | None:
     """Délai avant la première récolte, ou None (arbres fruitiers, espèce inconnue)."""
     return FIRST_HARVEST_DELAYS.get(code)
+
+# ======================================================================
+# Durée de vie et production optimale
+# ======================================================================
+#
+# Une plante pérenne VIT plus longtemps qu'elle ne PRODUIT bien : une
+# lavande peut vivre 10 ans mais produit le mieux entre 3 et 6 ans. En
+# pratique, la plantation est souvent renouvelée avant la mort des plants,
+# quand le rendement baisse. Les deux durées sont donc distinctes.
+#
+# Ce sont des FOURCHETTES : la durée réelle dépend du climat, du sol, de
+# l'irrigation (asphyxie racinaire), des maladies et de la taille. Une
+# mort bien avant la fourchette n'est pas une fin de vie normale : elle
+# signale un problème à rechercher.
+#
+# Les messages affichés INFORMENT, ils ne bloquent rien et ne décident
+# jamais à la place de l'utilisateur que la plante est morte.
+
+
+@dataclass(frozen=True)
+class Lifespan:
+    """Durée de vie et production optimale d'une espèce, en années."""
+
+    #: Fourchette de durée de vie (min, max), ou None si non renseignée
+    life_years: tuple[int, int] | None
+    #: Production optimale (début, fin) ; fin None si non renseignée
+    optimal_years: tuple[int, int | None] | None
+    source: str
+
+
+LIFESPANS: dict[str, Lifespan] = {
+    "menthe": Lifespan((3, 5), (1, 3),
+        "Base de données de référence des cultures AWAM : 3-5 ans (production optimale 1-3 ans)"),
+    "geranium": Lifespan((3, 5), (1, 3),
+        "Base de données de référence des cultures AWAM : 3-5 ans (production optimale 1-3 ans)"),
+    "sauge": Lifespan((5, 8), (2, 5),
+        "Base de données de référence des cultures AWAM : 5-8 ans (production optimale 2-5 ans)"),
+    "lavande": Lifespan((5, 10), (3, 6),
+        "Base de données de référence des cultures AWAM (L. stoechas, L. dentata) : "
+        "5-10 ans (production optimale 3-6 ans)"),
+    "verveine": Lifespan((5, 10), (2, 6),
+        "Base de données de référence des cultures AWAM : 5-10 ans (production optimale 2-6 ans)"),
+    "romarin": Lifespan((10, 15), None,
+        "Base de données de référence des cultures AWAM : environ 10-15 ans ou davantage ; "
+        "production intéressante dans les premières années (sans durée chiffrée)"),
+    "thym": Lifespan((5, 6), None,
+        "Recherche web de l'équipe : durée de vie de 5 à 6 ans ; production optimale non renseignée"),
+    "citronnelle": Lifespan(None, (3, None),
+        "Recherche web de l'équipe : vit plusieurs années ; meilleure production à partir de "
+        "3 à 4 ans ; durée de vie non chiffrée"),
+    "amandier": Lifespan((50, 80), (10, 40),
+        "Base de données de référence des cultures AWAM : 50-80 ans (production optimale 10-40 ans)"),
+    "caroubier": Lifespan((100, 200), (30, 100),
+        "Base de données de référence des cultures AWAM (source citée : blog) : "
+        "100-200 ans (production optimale 30-100 ans)"),
+    # « Production économique 50-100 ans » se lit comme une DURÉE de
+    # production, pas comme un âge de début : non utilisée, pour ne pas
+    # annoncer à tort qu'un olivier de 30 ans n'est pas en production.
+    "olivier": Lifespan((200, 500), None,
+        "Base de données de référence des cultures AWAM (source citée : blog) : "
+        "200-500 ans (production économique 50-100 ans, durée non utilisée)"),
+    # Basilic : annuel, une saison ; pas de durée de vie pluriannuelle
+}
+
+
+def get_lifespan(code: str) -> Lifespan | None:
+    return LIFESPANS.get(code.lower())
+
+
+def _years(n: int) -> str:
+    return f"{n} an" if n == 1 else f"{n} ans"
+
+
+def optimal_production_label(code: str) -> str | None:
+    """« 3 à 6 ans », « à partir de 3 ans », ou None si non renseignée."""
+    span = get_lifespan(code)
+    if not span or not span.optimal_years:
+        return None
+    start, end = span.optimal_years
+    if end is None:
+        return f"à partir de {_years(start)}"
+    return f"de {start} à {_years(end)}"
+
+
+def lifespan_note(code: str, age_years: float | None) -> tuple[str, str] | None:
+    """
+    Message à afficher selon l'âge de la plantation, ou None.
+
+    Renvoie (niveau, texte), le niveau valant :
+      "info"    : plantation jeune, pas encore en pleine production ;
+      "warning" : fin de la production optimale, ou au-delà de la durée de
+                  vie habituelle : envisager le renouvellement.
+    Rien n'est affiché quand la donnée manque : on n'invente pas de limite.
+    """
+    span = get_lifespan(code)
+    if not span or age_years is None:
+        return None
+
+    if span.life_years and age_years >= span.life_years[1]:
+        lo, hi = span.life_years
+        return ("warning",
+                f"Au-delà de la durée de vie habituelle de l'espèce ({lo} à {_years(hi)}) : "
+                "surveiller le dépérissement et envisager le renouvellement de la plantation.")
+
+    if span.optimal_years:
+        start, end = span.optimal_years
+        if end is not None and age_years >= end:
+            return ("warning",
+                    f"Fin de la production optimale (après {_years(end)}) : le rendement baisse "
+                    "habituellement ; envisager le renouvellement de la plantation.")
+        # Arbres fruitiers : l'entrée en production est déjà indiquée par la
+        # case « verger en production », saisie par l'utilisateur
+        if age_years < start and not is_orchard(code):
+            return ("info",
+                    f"Pas encore en pleine production : production optimale à partir de "
+                    f"{_years(start)}.")
+    return None

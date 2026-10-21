@@ -90,6 +90,9 @@ class NeedsResponse(BaseModel):
     soil: list[SoilRowResponse] = []
     #: Date de l'analyse de sol utilisée
     soil_analysis_date: Optional[date] = None
+    #: Culture clôturée (terminée, abandonnée, annuelle récoltée) : aucun
+    #: besoin n'est calculé, et voici pourquoi
+    closed_reason: Optional[str] = None
 
 
 class StageTimelineItem(BaseModel):

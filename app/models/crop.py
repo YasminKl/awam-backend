@@ -47,8 +47,12 @@ class Crop(Base):
     #: réelle est enregistrée. Conditionne le calcul de la récolte prévue.
     in_production = Column(Boolean, nullable=False, server_default="false")
 
-    #: "active" | "harvested" | "abandoned"
+    #: "active" | "harvested" | "abandoned" | "ended"
+    #:   abandoned : la culture a échoué avant terme ;
+    #:   ended     : une pérenne arrivée en fin de vie, arrachée (end_date)
     status = Column(String(20), nullable=False, server_default="active", index=True)
+    #: Date de fin (arrachage) d'une culture « Terminée »
+    end_date = Column(Date, nullable=True)
     notes = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -57,44 +57,44 @@ KC_VARIANTS: dict[str, KcSet] = {
 }
 
 
-#: Correspondance stade → phase FAO. Un stade absent prend "mid_season",
-#: la phase de plus forte demande, par prudence.
+#: Correspondance stade → phase FAO, sur les neuf stades du document AWAM
+#: (voir calendar.py). Un stade absent prend "mid_season", la phase de plus
+#: forte demande, par prudence.
 STAGE_TO_PHASE: dict[str, str] = {
     # Phase initiale : couvert absent ou minimal
-    "repos": "initial",
     "dormance": "initial",
-    "reprise": "initial",
     "debourrement": "initial",
-    "installation": "initial",
-    "semis": "initial",
-    "ralentissement": "initial",
     # Développement : le couvert se met en place
-    "developpement_pousses": "development",
     "croissance": "development",
-    "croissance_rapide": "development",
-    "boutons_floraux": "development",
-    "inflorescences": "development",
-    "prefloraison": "development",
-    "reprise_coupe": "development",
-    "reprise_automne": "development",
     # Mi-saison : demande maximale
     "floraison": "mid_season",
     "nouaison": "mid_season",
-    "formation_gousses": "mid_season",
-    "grossissement": "mid_season",
-    "developpement_max": "mid_season",
-    "developpement_foliaire": "mid_season",
+    "developpement": "mid_season",
     # Fin de saison : la demande retombe
     "maturation": "late_season",
     "recolte": "late_season",
-    "recoltes": "late_season",
-    "recolte_automne": "late_season",
-    "coupe": "late_season",
-    "coupes_successives": "late_season",
-    "coupes_suivantes": "late_season",
-    "post_recolte": "late_season",
-    "fin_cycle": "late_season",
+    # "apres_recolte" dépend de la plante : voir _phase()
 }
+
+
+def _phase(species: str, stage: str) -> str:
+    """
+    Phase FAO d'un stade pour une espèce.
+
+    L'APRÈS-RÉCOLTE regroupe deux situations qui avaient chacune leur code
+    avant la nomenclature à neuf stades, et garde leur phase d'alors :
+      - aromatique pérenne : la plante repousse après la coupe (ancien
+        « reprise après coupe ») → développement ;
+      - arbre fruitier ou annuelle : la saison est finie (anciens « après
+        récolte » et « fin de cycle ») → fin de saison.
+    """
+    if stage == "apres_recolte":
+        from app.services.agronomy.species import is_annual, is_orchard
+
+        if is_orchard(species) or is_annual(species):
+            return "late_season"
+        return "development"
+    return STAGE_TO_PHASE.get(stage, "mid_season")
 
 
 def get_kc(species: str, stage: str) -> float | None:
@@ -102,8 +102,24 @@ def get_kc(species: str, stage: str) -> float | None:
     kc_set = KC.get(species.lower())
     if not kc_set:
         return None
-    phase = STAGE_TO_PHASE.get(stage, "mid_season")
-    return getattr(kc_set, phase)
+    return getattr(kc_set, _phase(species.lower(), stage))
+
+
+def get_kc_for_stages(species: str, stages) -> float | None:
+    """
+    Coefficient cultural quand PLUSIEURS stades sont actifs à la même date
+    (calendar.get_stages_at().codes) : le plus élevé.
+
+    Le stade principal est choisi pour interpréter le satellite (la récolte
+    d'abord, elle explique la chute d'indice). Pour l'eau, ce n'est pas le
+    bon critère : le thym est récolté en juin pendant qu'il fleurit encore,
+    phase de plus forte demande. Prendre le Kc le plus élevé des stades
+    actifs suit la règle de prudence de ce module : ne pas sous-irriguer.
+    """
+    if isinstance(stages, str):
+        stages = (stages,)
+    values = [kc for kc in (get_kc(species, st) for st in stages) if kc is not None]
+    return max(values) if values else None
 
 
 # ======================================================================

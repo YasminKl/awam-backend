@@ -23,7 +23,9 @@ from app.models.utilisateur import User
 from app.schemas.crop import (
     CropCreate,
     ExpectedHarvestPreview,
+    CLOSED_STATUSES,
     check_crop_dates,
+    check_end,
     check_harvest,
     CropSuggestions,
     CropObservationCreate,
@@ -44,7 +46,9 @@ from app.services.agronomy.species import (
     get_varieties,
     is_annual,
     is_orchard,
+    lifespan_note,
     list_species,
+    optimal_production_label,
     parse_cultures,
     stage_label,
 )
@@ -146,6 +150,21 @@ def _keep_perennial_active(crop: Crop) -> None:
             crop.in_production = True
 
 
+def _apply_end_rules(crop: Crop) -> None:
+    """
+    « Terminée » est réservé aux PÉRENNES arrivées en fin de vie : une
+    annuelle se clôture par sa récolte. Hors « Terminée », la date de fin
+    n'a pas de sens et est effacée.
+    """
+    if crop.status == "ended" and is_annual(crop.species):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Une culture annuelle se clôture par « Récoltée », pas par « Terminée ».",
+        )
+    if crop.status != "ended":
+        crop.end_date = None
+
+
 def _compute_expected_harvest(crop: Crop) -> None:
     """
     Remplit la date de récolte prévue depuis le calendrier agronomique.
@@ -162,7 +181,7 @@ def _compute_expected_harvest(crop: Crop) -> None:
     Pour un arbre fruitier pas encore en production, la date reste vide :
     le système ne devine pas l'année de première récolte.
     """
-    if crop.status == "abandoned":
+    if crop.status in CLOSED_STATUSES:
         crop.expected_harvest_date = None
         return
 
@@ -210,7 +229,7 @@ def _refresh_cycle(crop: Crop, db: Session) -> None:
     """
     _sync_harvest_date(crop, db)
 
-    if crop.status == "abandoned":
+    if crop.status in CLOSED_STATUSES:
         return
     if is_annual(crop.species):
         return
@@ -225,8 +244,20 @@ def _refresh_cycle(crop: Crop, db: Session) -> None:
     _compute_expected_harvest(crop)
 
 
+def _age_years(planting_date: Optional[date], at: Optional[date] = None) -> Optional[float]:
+    """Âge de la plantation en années, à la date du jour ou à `at`."""
+    if planting_date is None:
+        return None
+    reference = at or date.today()
+    return round(max((reference - planting_date).days, 0) / 365.25, 1)
+
+
 def _to_response(crop: Crop) -> CropResponse:
     spec = SPECIES.get(crop.species)
+    # Culture terminée : son âge s'arrête à sa date de fin
+    age = _age_years(crop.planting_date, crop.end_date if crop.status == "ended" else None)
+    # Message de durée de vie : seulement pour une culture encore en place
+    note = lifespan_note(crop.species, age) if crop.status == "active" else None
     return CropResponse(
         id=crop.id,
         parcel_id=crop.parcel_id,
@@ -242,7 +273,12 @@ def _to_response(crop: Crop) -> CropResponse:
         in_production=bool(crop.in_production),
         is_orchard=is_orchard(crop.species),
         is_annual=is_annual(crop.species),
+        age_years=age,
+        optimal_production=optimal_production_label(crop.species),
+        lifespan_level=note[0] if note else None,
+        lifespan_note=note[1] if note else None,
         status=crop.status,
+        end_date=crop.end_date,
         notes=crop.notes,
         created_at=crop.created_at,
     )
@@ -341,7 +377,8 @@ def get_crop_suggestions(
       - culture en cours ;
       - ou pérenne récoltée : la plante reste en place après la récolte.
     Une annuelle récoltée (basilic) est reproposée : son cycle est fini.
-    Une culture abandonnée libère toujours l'espèce.
+    Une culture abandonnée ou terminée libère toujours l'espèce : une
+    lavande arrachée en fin de vie peut être replantée.
     """
     parcel = _get_owned_parcel(parcel_id, user, db)
     found, unknown = parse_cultures(parcel.culture_type)
@@ -413,10 +450,11 @@ def create_crop(
     if not is_orchard(crop.species):
         crop.in_production = False
     _keep_perennial_active(crop)
+    _apply_end_rules(crop)
     if not manual_expected:
         _compute_expected_harvest(crop)
     # Culture abandonnée : elle ne sera jamais récoltée
-    if crop.status == "abandoned":
+    if crop.status in CLOSED_STATUSES:
         crop.expected_harvest_date = None
 
     db.add(crop)
@@ -441,6 +479,11 @@ def update_crop(
     if not is_orchard(crop.species):
         crop.in_production = False
     _keep_perennial_active(crop)
+    try:
+        _apply_end_rules(crop)
+    except HTTPException:
+        db.rollback()
+        raise
 
     # Recalcul de la récolte prévue, sauf si l'utilisateur vient de la
     # saisir lui-même. Chez une pérenne, une nouvelle date de récolte
@@ -454,7 +497,7 @@ def update_crop(
             _compute_expected_harvest(crop)
 
     # Culture abandonnée : elle ne sera jamais récoltée
-    if crop.status == "abandoned":
+    if crop.status in CLOSED_STATUSES:
         crop.expected_harvest_date = None
 
     # Cohérence sur l'état FINAL de la culture, après le recalcul de la
@@ -464,6 +507,7 @@ def update_crop(
     try:
         check_crop_dates(crop.planting_date, crop.expected_harvest_date, crop.actual_harvest_date)
         check_harvest(crop.status, crop.actual_harvest_date, crop.actual_yield, crop.yield_unit)
+        check_end(crop.status, crop.planting_date, crop.end_date)
     except ValueError as e:
         db.rollback()
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))

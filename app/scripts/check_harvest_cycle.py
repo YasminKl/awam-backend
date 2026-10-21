@@ -324,6 +324,74 @@ def check_stages() -> None:
     check("anciens codes de stades supprimes", restants, [])
 
 
+def check_species_and_water() -> None:
+    """species.py et water.py alignes sur les neuf stades du calendrier."""
+    from app.services.agronomy.species import SPECIES, STAGE_LABELS, stage_label
+    from app.services.agronomy.water import (
+        STAGE_TO_PHASE, get_kc, get_kc_for_stages,
+    )
+    from app.services.water_service import compute_water_need
+
+    # La liste des stades de chaque espece = l'ordre de son calendrier
+    ecarts = []
+    for sp, periods in PHENOLOGY.items():
+        ordre = []
+        for p in periods:
+            if p.stage not in ordre:
+                ordre.append(p.stage)
+        if tuple(ordre) != SPECIES[sp].stages:
+            ecarts.append(sp)
+    check("species.py : stades de chaque espece = ceux du calendrier", ecarts, [])
+
+    # Chaque stade du calendrier a un libelle et une phase FAO explicites
+    codes = {p.stage for per in PHENOLOGY.values() for p in per}
+    sans_libelle = sorted(c for c in codes if c not in STAGE_LABELS)
+    check("libelles : les 9 stades ont un libelle", sans_libelle, [])
+    check("libelle de l'apres-recolte", stage_label("apres_recolte"), "Après récolte")
+    sans_phase = sorted(c for c in codes if c not in STAGE_TO_PHASE and c != "apres_recolte")
+    check("water.py : chaque stade a sa phase FAO, aucun par defaut", sans_phase, [])
+
+    # Apres-recolte : la phase d'avant le lot B, selon la plante
+    check("Kc thym apres-recolte = developpement (repousse)", get_kc("thym", "apres_recolte"), 0.45)
+    check("Kc amandier apres-recolte = fin de saison", get_kc("amandier", "apres_recolte"), 0.70)
+    check("Kc basilic apres-recolte = fin de saison", get_kc("basilic", "apres_recolte"), 0.90)
+
+    # Plusieurs stades actifs : le Kc le plus eleve
+    juin = get_stages_at("thym", date(2027, 6, 15)).codes
+    check("Kc thym en juin : pleine saison, pas fin de saison", get_kc_for_stages("thym", juin), 0.65)
+    besoin = compute_water_need("thym", juin, et0_mm=40.0, rain_mm=0.0, area_ha=1.0)
+    check("besoin en eau du thym en juin : ETc = 40 x 0,65", besoin.etc_mm, 26.0)
+
+
+def check_lifespan() -> None:
+    """Duree de vie et production optimale : messages selon l'age."""
+    from app.services.agronomy.species import lifespan_note
+
+    niveau = lambda sp, age: (lifespan_note(sp, age) or ("aucun",))[0]
+    check("lavande 1 an : pas encore en pleine production", niveau("lavande", 1), "info")
+    check("lavande 4 ans : production optimale, aucun message", niveau("lavande", 4), "aucun")
+    check("lavande 7 ans : fin de la production optimale", niveau("lavande", 7), "warning")
+    check("lavande 11 ans : au-dela de la duree de vie", "durée de vie" in lifespan_note("lavande", 11)[1], True)
+    check("citronnelle 2 ans : meilleure production a partir de 3 ans", niveau("citronnelle", 2), "info")
+    check("citronnelle 10 ans : aucune limite inventee", niveau("citronnelle", 10), "aucun")
+    check("olivier 30 ans : aucun message (pas d'age de debut invente)", niveau("olivier", 30), "aucun")
+    check("basilic : annuel, aucun message", niveau("basilic", 1), "aucun")
+
+    # Culture « Terminee » : date de fin obligatoire et coherente
+    from app.schemas.crop import check_end
+
+    def refus(*args):
+        try:
+            check_end(*args, today=date(2026, 10, 20))
+            return "accepte"
+        except ValueError as e:
+            return str(e)
+
+    check("terminee sans date de fin : refusee", "date de fin" in refus("ended", date(2017, 3, 1), None), True)
+    check("terminee, date de fin future : refusee", "futur" in refus("ended", date(2017, 3, 1), date(2027, 1, 1)), True)
+    check("terminee le 15-09-2026 : acceptee", refus("ended", date(2017, 3, 1), date(2026, 9, 15)), "accepte")
+
+
 def check_no_regression() -> None:
     stage = get_stage_at("olivier", date(2027, 11, 15))
     check("olivier en novembre -> recolte", stage.stage if stage else None, "recolte")
@@ -495,6 +563,8 @@ def main() -> int:
     check_calendar()
     check_corrections()
     check_stages()
+    check_species_and_water()
+    check_lifespan()
     check_no_regression()
     check_routes()
 
