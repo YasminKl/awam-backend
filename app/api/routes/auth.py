@@ -7,6 +7,11 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta, timezone
 from app.services.email_service import send_reset_password_email
+from app.services.login_guard import (
+    ensure_login_allowed,
+    record_failed_login,
+    reset_failed_logins,
+)
 
 from app.core.config import FRONTEND_URL, GOOGLE_REDIRECT_URI, ENVIRONMENT, ADMIN_EMAIL
 from app.core.security import (
@@ -79,21 +84,28 @@ async def register(payload: RegisterRequest, response: Response, db: Session = D
 
 
 @router.post("/login", response_model=AuthResponse)
-async def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
+async def login(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    # Trop d'échecs récents pour ce compte ou cette adresse : refus (429),
+    # AVANT toute vérification du mot de passe (app/services/login_guard.py)
+    ip = request.client.host if request.client else None
+    ensure_login_allowed(payload.email, ip)
+
     user = db.query(User).filter(func.lower(User.email) == payload.email).first()  # ⬅️ CASSE E-MAIL
 
-    if not user or not user.password_hash:
+    if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
+        # Même message et même comptage, que le compte existe ou non
+        record_failed_login(payload.email, ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="E-mail ou mot de passe incorrect.",
         )
 
-    if not verify_password(payload.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="E-mail ou mot de passe incorrect.",
-        )
-
+    reset_failed_logins(payload.email)
     set_auth_cookie(response, user.id)
     return {"user": user}
 

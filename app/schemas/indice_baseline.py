@@ -31,3 +31,6 @@ class IndiceBaselineResponse(BaseModel):
     message: str = ""
     #: Demi-largeur de la fenêtre, en jours, autour du même jour de l'année
     window_days: int
+    #: Début de la plantation actuelle : seules les mesures postérieures
+    #: servent de référence (None : tout l'historique de la parcelle)
+    since: Optional[date] = None

@@ -37,7 +37,7 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.profile import router as profile_router
 from app.db.database import SessionLocal
 from app.models.utilisateur import User
-from sqlalchemy import func  # ⬅️ CASSE E-MAIL
+from sqlalchemy import func  
 
 from app.api.routes.parcels import router as parcels_router
 from app.api.routes.vector_layers import router as vector_layers_router
@@ -45,18 +45,22 @@ from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.raster import router as raster_router
 from app.api.routes.farms import router as farm_router
 from titiler.core.factory import TilerFactory
+from fastapi import Depends
+from app.core.security import get_current_user
+from app.services.cog_access import b2_cog_url
 from titiler.core.errors import DEFAULT_STATUS_CODES, add_exception_handlers
 from app.api.routes.agenda import router as agenda_router
 from app.api.routes.indices import router as indices_router
 from app.api.routes.alerts import router as alerts_router
 from app.api.routes.employees import router as employees_router
-from app.api.routes.farm_employees import router as farm_employees_router  # ⬅️ AJOUT
+from app.api.routes.farm_employees import router as farm_employees_router  
 from app.api.routes.activities import router as activities_router
 from app.api.routes.weather import router as weather_router
 from app.api.routes.parcel_analyses import router as parcel_analyses_router
 from app.api.routes.crops import router as crops_router
 from app.api.routes.diagnosis import router as diagnosis_router
 from app.api.routes.events import router as events_router
+from app.api.routes.task_types import router as task_types_router
 
 print("🔵 Lancement de l'application FastAPI...")
 
@@ -119,8 +123,8 @@ app.include_router(alerts_router, prefix="/api")
 print("🔵 Ajout du router employees...")
 app.include_router(employees_router, prefix="/api")
 
-print("🔵 Ajout du router farm_employees...")  
-app.include_router(farm_employees_router, prefix="/api")  
+print("🔵 Ajout du router farm_employees...")  # ⬅️ AJOUT
+app.include_router(farm_employees_router, prefix="/api")  # ⬅️ AJOUT
 
 print("🔵 Ajout du router activities...")
 app.include_router(activities_router, prefix="/api")
@@ -140,6 +144,8 @@ app.include_router(diagnosis_router, prefix="/api")
 print("🔵 Ajout du router events...")
 app.include_router(events_router, prefix="/api")
 
+print("🔵 Ajout du router task...")
+app.include_router(task_types_router, prefix="/api")
 # ==================================================================
 # Titiler
 # ==================================================================
@@ -147,8 +153,16 @@ print("🔵 Ajout des handlers d'exception titiler...")
 add_exception_handlers(app, DEFAULT_STATUS_CODES)
 
 print("🔵 Ajout du router titiler (COG)...")
-cog = TilerFactory()
-app.include_router(cog.router, prefix="/cog", tags=["COG"])
+# Routes /cog/… protégées (voir app/services/cog_access.py) :
+#   - authentification obligatoire ;
+#   - seules les images du bucket B2 du projet peuvent être lues.
+cog = TilerFactory(path_dependency=b2_cog_url)
+app.include_router(
+    cog.router,
+    prefix="/cog",
+    tags=["COG"],
+    dependencies=[Depends(get_current_user)],
+)
 
 print("✅ Application prête !")
 

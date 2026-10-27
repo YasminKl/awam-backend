@@ -35,6 +35,11 @@ class FarmEmployee(Base):
     role = Column(String(50), nullable=True)          # 'ouvrier', 'contremaître', 'chef d'équipe'
     hired_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(String(10), nullable=False, server_default="true")
+    #: Équipe de l'employé DANS CETTE FERME : le code d'un type de tâche
+    #: (« irrigation », ou un type libre comme « Paillage »), ou None si
+    #: l'employé est sans équipe. Une ligne par employé et par ferme :
+    #: un employé a donc une seule équipe par ferme.
+    team = Column(String(60), nullable=True)
 
     # Contrainte : un employé ne peut être lié qu'une fois à une ferme
     __table_args__ = (

@@ -101,3 +101,23 @@ class StageTimelineItem(BaseModel):
     period: str
     is_current: bool = False
     cultural_drop: bool = False
+
+
+class ParcelInterpretation(BaseModel):
+    """
+    Interprétation, déjà enregistrée, de l'analyse d'une date pour une
+    culture : indices, verdict de chaque indice, et lecture du diagnostic.
+    """
+
+    crop_id: int
+    crop_label: str
+    scene_date: date
+    stage_label: Optional[str] = None
+    #: normal | watch | alert | strong_alert
+    severity: str
+    severity_label: str
+    #: Lecture du diagnostic, ex. « Stress hydrique précoce »
+    reading: Optional[str] = None
+    #: Vrai en période de coupe ou de récolte : la baisse est attendue
+    cultural_drop: bool = False
+    indicators: list[IndicatorResponse] = []

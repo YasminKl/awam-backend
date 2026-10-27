@@ -20,7 +20,7 @@ from datetime import date, timedelta
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models.activity import Activity
+from app.models.activity import DONE_STATUSES, Activity
 from app.models.crop import Crop
 from app.models.crop_diagnosis import CropDiagnosis
 from app.services.diagnosis_service import Diagnosis, diagnose
@@ -84,7 +84,12 @@ def has_recent_harvest(db: Session, crop: Crop, reference: date) -> bool:
     since = reference - timedelta(days=HARVEST_WINDOW_DAYS)
     activities = (
         db.query(Activity)
-        .filter(Activity.crop_id == crop.id, Activity.performed_at >= since)
+                # Seules les tâches FAITES comptent : une coupe planifiée n'a pas eu lieu
+        .filter(
+            Activity.crop_id == crop.id,
+            Activity.status.in_(DONE_STATUSES),
+            Activity.performed_at >= since,
+        )
         .all()
     )
     return any(

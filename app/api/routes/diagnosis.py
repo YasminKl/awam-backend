@@ -6,16 +6,17 @@ routes décident. La même logique servira donc aux alertes par e-mail et
 à toute autre interface.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.db.database import get_db
 from app.models.crop import Crop
+from app.models.crop_diagnosis import CropDiagnosis
 from app.models.farm import Farm
 from app.models.parcel import Parcel
 from app.models.parcel_analysis import ParcelAnalysis
@@ -24,6 +25,7 @@ from app.schemas.diagnosis import (
     DiagnosisResponse,
     IndicatorResponse,
     NeedsResponse,
+    ParcelInterpretation,
     RiskResponse,
     SoilRowResponse,
     StageInfo,
@@ -31,8 +33,9 @@ from app.schemas.diagnosis import (
     WaterNeedResponse,
 )
 from app.services.agronomy.calendar import get_periods, get_stage_at, get_stages_at
-from app.services.agronomy.species import is_annual, stage_label
+from app.services.agronomy.species import SPECIES, is_annual, stage_label
 from app.services.agronomy.water import evaluate_soil
+from app.services.alert_service import SEVERITY_LABELS, sync_alert
 from app.services.crop_monitoring import archive_diagnosis, run_diagnosis
 from app.services.water_service import get_water_need
 
@@ -113,6 +116,8 @@ def get_crop_diagnosis(
 
     result, scene = run_diagnosis(db, crop)
     archive_diagnosis(db, crop, result, scene)
+    # L'alerte suit la même interprétation (traitement idempotent)
+    sync_alert(db, crop, result, scene)
 
     reference_date = scene.scene_date or date.today()
     days = (
@@ -178,6 +183,66 @@ def get_crop_stages(
         )
         for p in get_periods(crop.species, crop.planting_date)
     ]
+
+
+@router.get("/parcels/{parcel_id}/interpretations", response_model=List[ParcelInterpretation])
+def list_parcel_interpretations(
+    parcel_id: int,
+    days: int = Query(5, ge=1, le=31),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Interprétations DÉJÀ ENREGISTRÉES des analyses de la parcelle, pour les
+    images des `days` derniers jours : indices, verdict de chaque indice et
+    lecture du diagnostic, culture par culture. Lecture seule : rien n'est
+    recalculé (l'interprétation est faite par crop_monitoring).
+    """
+    parcel = (
+        db.query(Parcel)
+        .join(Farm, Parcel.farm_id == Farm.id)
+        .filter(Parcel.id == parcel_id, Farm.user_id == user.id)
+        .first()
+    )
+    if not parcel:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Parcelle introuvable.")
+
+    since = date.today() - timedelta(days=days)
+    rows = (
+        db.query(CropDiagnosis, Crop)
+        .join(Crop, CropDiagnosis.crop_id == Crop.id)
+        .filter(Crop.parcel_id == parcel_id, CropDiagnosis.scene_date >= since)
+        .order_by(CropDiagnosis.scene_date.desc(), Crop.id)
+        .all()
+    )
+
+    items: list[ParcelInterpretation] = []
+    for diag, crop in rows:
+        spec = SPECIES.get(crop.species)
+        items.append(
+            ParcelInterpretation(
+                crop_id=crop.id,
+                crop_label=spec.label if spec else crop.species,
+                scene_date=diag.scene_date,
+                stage_label=stage_label(diag.stage) if diag.stage else None,
+                severity=diag.severity,
+                severity_label=SEVERITY_LABELS.get(diag.severity, diag.severity),
+                reading=diag.diagnosis,
+                cultural_drop=diag.cultural_drop == "true",
+                indicators=[
+                    IndicatorResponse(
+                        name=i.get("name"),
+                        value=i.get("value"),
+                        delta=i.get("delta"),
+                        level=i.get("level"),
+                        threshold_label=i.get("threshold_label") or "",
+                        unit=i.get("unit") or "",
+                    )
+                    for i in (diag.indicators or [])
+                ],
+            )
+        )
+    return items
 
 
 # ----------------------------------------------------------------------

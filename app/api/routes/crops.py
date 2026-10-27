@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.db.database import get_db
-from app.models.activity import Activity
+from app.models.activity import DONE_STATUSES, Activity
 from app.models.crop import Crop
 from app.models.crop_observation import CropObservation
 from app.models.farm import Farm
@@ -91,9 +91,14 @@ def _get_owned_crop(crop_id: int, user: User, db: Session) -> Crop:
 
 def _last_harvest_activity(crop: Crop, db: Session) -> Optional[date]:
     """Date de la dernière activité de type récolte ou coupe, ou None."""
+    # Seules les tâches FAITES comptent : une récolte planifiée n'a pas eu lieu
     activities = (
         db.query(Activity)
-        .filter(Activity.crop_id == crop.id)
+        .filter(
+            Activity.crop_id == crop.id,
+            Activity.status.in_(DONE_STATUSES),
+            Activity.performed_at.isnot(None),
+        )
         .order_by(Activity.performed_at.desc())
         .all()
     )
@@ -223,24 +228,12 @@ def _refresh_cycle(crop: Crop, db: Session) -> None:
     pour que la récolte suivante d'une pérenne apparaisse sans action
     manuelle.
 
-    Le recalcul n'a lieu que si la date prévue est devenue caduque,
-    c'est-à-dire absente ou antérieure à la récolte qui vient d'avoir
-    lieu. Une date future saisie à la main n'est donc jamais écrasée.
+    La récolte prévue n'est JAMAIS saisie à la main : elle est toujours
+    calculée, depuis la plantation ou depuis la dernière récolte. Elle est
+    donc recalculée à chaque lecture, ce qui la garde à jour (saison
+    suivante) et remplace toute ancienne date saisie à la main.
     """
     _sync_harvest_date(crop, db)
-
-    if crop.status in CLOSED_STATUSES:
-        return
-    if is_annual(crop.species):
-        return
-    if crop.actual_harvest_date is None:
-        return
-    if (
-        crop.expected_harvest_date is not None
-        and crop.expected_harvest_date > crop.actual_harvest_date
-    ):
-        return
-
     _compute_expected_harvest(crop)
 
 
@@ -444,15 +437,15 @@ def create_crop(
     _get_owned_parcel(payload.parcel_id, user, db)
 
     data = payload.model_dump()
-    manual_expected = data.get("expected_harvest_date") is not None
+    # La récolte prévue est toujours calculée : une date envoyée est ignorée
+    data.pop("expected_harvest_date", None)
 
     crop = Crop(**data)
     if not is_orchard(crop.species):
         crop.in_production = False
     _keep_perennial_active(crop)
     _apply_end_rules(crop)
-    if not manual_expected:
-        _compute_expected_harvest(crop)
+    _compute_expected_harvest(crop)
     # Culture abandonnée : elle ne sera jamais récoltée
     if crop.status in CLOSED_STATUSES:
         crop.expected_harvest_date = None
@@ -473,6 +466,8 @@ def update_crop(
     crop = _get_owned_crop(crop_id, user, db)
 
     changes = payload.model_dump(exclude_unset=True)
+    # La récolte prévue est toujours calculée : une date envoyée est ignorée
+    changes.pop("expected_harvest_date", None)
     for field, value in changes.items():
         setattr(crop, field, value)
 
@@ -485,16 +480,10 @@ def update_crop(
         db.rollback()
         raise
 
-    # Recalcul de la récolte prévue, sauf si l'utilisateur vient de la
-    # saisir lui-même. Chez une pérenne, une nouvelle date de récolte
-    # réelle ouvre le cycle suivant : elle déclenche donc le recalcul.
-    if "expected_harvest_date" not in changes:
-        triggers = {
-            "species", "planting_date", "in_production",
-            "status", "actual_harvest_date",
-        }
-        if triggers & changes.keys():
-            _compute_expected_harvest(crop)
+    # Récolte prévue toujours recalculée, d'après l'état final de la
+    # culture : plantation, dernière récolte, statut, verger en production.
+    # Chez une pérenne, une nouvelle récolte réelle ouvre le cycle suivant.
+    _compute_expected_harvest(crop)
 
     # Culture abandonnée : elle ne sera jamais récoltée
     if crop.status in CLOSED_STATUSES:

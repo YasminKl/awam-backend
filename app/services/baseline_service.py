@@ -65,6 +65,9 @@ class Baseline:
     verdict: str | None = None
     message: str = ""
     window_days: int = WINDOW_DAYS
+    #: Début de la plantation actuelle : les mesures antérieures, prises
+    #: sur une autre végétation, ne servent pas de référence
+    since: date | None = None
 
 
 def _day_distance(a: date, b: date) -> int:
@@ -80,17 +83,22 @@ def compute_baseline(
     series: list[tuple[date, float]],
     reference_date: date,
     value: float,
+    since: date | None = None,
 ) -> Baseline:
     """
     Calcule la plage habituelle autour de `reference_date` et situe `value`.
 
     `series` : toutes les mesures de la parcelle pour cet indice (date, valeur).
+    `since`  : début de la plantation actuelle. Les mesures antérieures
+               décrivent une autre végétation (l'ancienne lavande adulte
+               qu'une jeune plantation remplace) : elles sont écartées.
     Fonction pure, sans accès à la base : facile à tester.
     """
     result = Baseline(
         indice_name=indice_name,
         reference_date=reference_date,
         value=value,
+        since=since,
     )
 
     past = [
@@ -98,6 +106,7 @@ def compute_baseline(
         for d, v in series
         if (reference_date - d).days >= EXCLUDE_RECENT_DAYS
         and _day_distance(d, reference_date) <= WINDOW_DAYS
+        and (since is None or d >= since)
     ]
     years = sorted({d.year for d, _ in past})
     result.values_count = len(past)
@@ -105,6 +114,15 @@ def compute_baseline(
 
     if len(past) < MIN_VALUES or len(years) < MIN_YEARS:
         result.status = "insufficient"
+        if since is not None:
+            result.message = (
+                f"Plantation depuis le {since.strftime('%d/%m/%Y')} : pas encore assez "
+                f"d'historique depuis cette plantation ({len(past)} mesure(s) sur "
+                f"{len(years)} année(s), il en faut au moins {MIN_VALUES} sur "
+                f"{MIN_YEARS} années). Les mesures antérieures, prises sur une autre "
+                "végétation, ne sont pas utilisées."
+            )
+            return result
         result.message = (
             f"Historique insuffisant à cette période ({len(past)} mesure(s) "
             f"sur {len(years)} année(s), il en faut au moins {MIN_VALUES} "
@@ -131,10 +149,33 @@ def compute_baseline(
     return result
 
 
+def current_plantation_start(db: Session, parcel_id: int) -> date | None:
+    """
+    Début de la végétation actuelle de la parcelle : la plantation LA PLUS
+    RÉCENTE parmi les cultures en place (statut « active »).
+
+    Une parcelle peut porter plusieurs cultures (oliviers et aromatiques
+    entre les rangs) : le signal satellite est celui de leur mélange, qui
+    change dès qu'une culture est ajoutée ou remplacée. Seules les mesures
+    postérieures à ce changement décrivent la végétation actuelle.
+
+    None si aucune culture en place n'est déclarée : tout l'historique est
+    alors utilisé, comme avant.
+    """
+    return db.execute(
+        text("""
+            SELECT MAX(planting_date) FROM crop
+            WHERE parcel_id = :pid AND status = 'active'
+        """),
+        {"pid": parcel_id},
+    ).scalar()
+
+
 def baseline_for_latest(db: Session, parcel_id: int, indice_name: str) -> Baseline:
     """
     Plage habituelle pour la mesure LA PLUS RÉCENTE d'un indice sur une
-    parcelle. Seules les mesures valides sont prises en compte.
+    parcelle. Seules les mesures valides, et postérieures au début de la
+    plantation actuelle, sont prises en compte.
     """
     rows = db.execute(
         text("""
@@ -158,4 +199,7 @@ def baseline_for_latest(db: Session, parcel_id: int, indice_name: str) -> Baseli
 
     series = [(r.scene_date, float(r.value)) for r in rows]
     reference_date, value = series[-1]
-    return compute_baseline(indice_name, series, reference_date, value)
+    return compute_baseline(
+        indice_name, series, reference_date, value,
+        since=current_plantation_start(db, parcel_id),
+    )

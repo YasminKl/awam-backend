@@ -8,7 +8,7 @@ Contrôle que :
     date de plantation ;
   - une annuelle se clôture bien en `harvested` ;
   - la date de récolte réelle suit la DERNIÈRE coupe, pas la première ;
-  - une date de récolte prévue saisie à la main n'est pas écrasée ;
+  - la date de récolte prévue est toujours calculée, jamais saisie ;
   - les quatre corrections de périodes tirées du document AWAM sont
     bien en place (amandier, olivier, citronnelle, caroubier) ;
   - le reste du calendrier n'a pas changé de comportement
@@ -391,6 +391,23 @@ def check_lifespan() -> None:
     check("terminee, date de fin future : refusee", "futur" in refus("ended", date(2017, 3, 1), date(2027, 1, 1)), True)
     check("terminee le 15-09-2026 : acceptee", refus("ended", date(2017, 3, 1), date(2026, 9, 15)), "accepte")
 
+    # Plage habituelle : seulement les mesures de la plantation actuelle
+    from app.services.baseline_service import compute_baseline
+
+    serie = [
+        (date(an, 10, j), v)
+        for an in (2023, 2024, 2025)
+        for j, v in zip((5, 10, 15, 20, 25), (0.48, 0.50, 0.52, 0.49, 0.51))
+    ]
+    ref = date(2026, 10, 15)
+    check("plage habituelle sans plantation declaree : tout l'historique",
+          compute_baseline("NDVI", serie, ref, 0.22).status, "ok")
+    check("plage habituelle, plantation de 2016 : historique 2023-2025 utilise",
+          compute_baseline("NDVI", serie, ref, 0.22, since=date(2016, 3, 1)).status, "ok")
+    jeune = compute_baseline("NDVI", serie, ref, 0.22, since=date(2026, 10, 1))
+    check("jeune plantation : l'ancienne vegetation n'est pas comparee",
+          (jeune.status, jeune.verdict), ("insufficient", None))
+
 
 def check_no_regression() -> None:
     stage = get_stage_at("olivier", date(2027, 11, 15))
@@ -465,9 +482,9 @@ def check_routes() -> None:
     crop = fake_crop(expected_harvest_date=date(2029, 6, 15))
     _refresh_cycle(crop, FakeQuery([fake_activity("coupe", 2028, 5, 20)]))
     check(
-        "date prevue saisie a la main : preservee",
+        "ancienne date prevue saisie a la main : toujours recalculee",
         crop.expected_harvest_date,
-        date(2029, 6, 15),
+        date(2029, 5, 1),
     )
 
     crop = fake_crop(expected_harvest_date=date(2028, 5, 1))

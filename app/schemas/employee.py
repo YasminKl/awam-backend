@@ -30,6 +30,8 @@ class EmployeeCreate(BaseModel):
 class EmployeeUpdate(BaseModel):
     full_name: Optional[str] = None
     phone: Optional[str] = None
+    #: Faux : rendre l'employé inactif ; vrai : le réactiver
+    is_active: Optional[bool] = None
 
     @field_validator("full_name")
     @classmethod
@@ -58,6 +60,7 @@ class EmployeeResponse(BaseModel):
     id: int
     full_name: str
     phone: Optional[str] = None
+    is_active: bool = True
 
     class Config:
         from_attributes = True
