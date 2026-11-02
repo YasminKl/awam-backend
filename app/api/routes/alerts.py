@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
@@ -122,6 +123,7 @@ def _to_response(alert: Alert, db: Session) -> AlertResponse:
         crop_id=alert.crop_id,
         crop_label=(spec.label if spec else crop.species) if crop else None,
         parcel_name=parcel.name if parcel else None,
+        farm_id=farm.id if farm else None,
         farm_name=farm.name if farm else None,
         cause=alert.cause,
         evidence=alert.evidence,
@@ -137,20 +139,38 @@ def _to_response(alert: Alert, db: Session) -> AlertResponse:
     )
 
 
+#: Ordre de gravité : la plus grave d'abord ; un niveau inconnu passe en dernier
+SEVERITY_ORDER = case(
+    (Alert.severity == "strong_alert", 0),
+    (Alert.severity == "alert", 1),
+    (Alert.severity == "watch", 2),
+    else_=3,
+)
+
+
 @router.get("/alerts", response_model=List[AlertResponse])
 async def list_alerts(
     state: Literal["open", "closed", "all"] = Query("open"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Alertes de toutes les parcelles de l'utilisateur, les plus récentes d'abord."""
+    """
+    Alertes de toutes les parcelles de l'utilisateur, dans l'ordre où il faut
+    les traiter : la plus GRAVE d'abord, puis, à gravité égale, celle APPARUE
+    le plus récemment (date de la première image de l'épisode, la même que
+    « il y a N j » dans la cloche).
+    """
     _close_orphans(user, db)
     query = _owned_alerts(user, db)
     if state == "open":
         query = query.filter(Alert.resolved.is_(False))
     elif state == "closed":
         query = query.filter(Alert.resolved.is_(True))
-    alerts = query.order_by(Alert.last_scene_date.desc().nullslast(), Alert.created_at.desc()).all()
+    alerts = query.order_by(
+        SEVERITY_ORDER,
+        func.coalesce(Alert.first_scene_date, Alert.last_scene_date).desc().nullslast(),
+        Alert.created_at.desc(),
+    ).all()
     return [_to_response(a, db) for a in alerts]
 
 

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, field_validator
@@ -31,6 +31,8 @@ class ActivityCreate(BaseModel):
     status: ActivityStatus = "realisee"
     #: Date prévue, obligatoire pour une tâche à réaliser
     planned_for: Optional[date] = None
+    #: Heure prévue, facultative
+    planned_time: Optional[time] = None
     #: Date réelle d'une tâche faite ; maintenant si absente
     performed_at: Optional[datetime] = None
     crop_id: Optional[int] = None
@@ -55,6 +57,7 @@ class ActivityUpdate(BaseModel):
     activity_type: Optional[str] = None
     status: Optional[ActivityStatus] = None
     planned_for: Optional[date] = None
+    planned_time: Optional[time] = None
     performed_at: Optional[datetime] = None
     crop_id: Optional[int] = None
     team: Optional[str] = None
@@ -100,6 +103,7 @@ class ActivityResponse(BaseModel):
     activity_type: str
     status: str = "realisee"
     planned_for: Optional[date] = None
+    planned_time: Optional[time] = None
     performed_at: Optional[datetime] = None
     crop_id: Optional[int] = None
     team: Optional[str] = None
@@ -108,3 +112,10 @@ class ActivityResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class FarmHistoryItem(ActivityResponse):
+    """Tâche faite d'une ferme, avec sa parcelle et sa culture en clair."""
+
+    parcel_name: str
+    crop_label: Optional[str] = None

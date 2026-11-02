@@ -15,7 +15,7 @@ Une tâche peut avoir des tâches ATTACHÉES (parent_id), ex. une irrigation
 attachée à une plantation ; supprimer la principale supprime les attachées.
 """
 
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String, Table
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String, Table, Time
 from sqlalchemy.orm import backref, relationship
 from sqlalchemy.sql import func
 
@@ -32,8 +32,9 @@ DONE_STATUSES = (STATUS_DONE, STATUS_FOLLOW_UP)
 activity_employee = Table(
     "activity_employee",
     Base.metadata,
-    Column("activity_id", Integer, ForeignKey("activity.id"), primary_key=True),
-    Column("employee_id", Integer, ForeignKey("employee.id"), primary_key=True),
+    # Supprimer une activité ou un employé supprime leurs liens (cascade)
+    Column("activity_id", Integer, ForeignKey("activity.id", ondelete="CASCADE"), primary_key=True),
+    Column("employee_id", Integer, ForeignKey("employee.id", ondelete="CASCADE"), primary_key=True),
 )
 
 
@@ -41,7 +42,8 @@ class Activity(Base):
     __tablename__ = "activity"
 
     id = Column(Integer, primary_key=True, index=True)
-    parcel_id = Column(Integer, ForeignKey("parcel.id"), nullable=False, index=True)
+    #: Supprimer la parcelle supprime ses activités (cascade dans la base)
+    parcel_id = Column(Integer, ForeignKey("parcel.id", ondelete="CASCADE"), nullable=False, index=True)
 
     activity_type = Column(String(100), nullable=False)
     crop_id = Column(
@@ -51,6 +53,8 @@ class Activity(Base):
     status = Column(String(20), nullable=False, server_default=STATUS_DONE)
     #: Date prévue (tâche planifiée)
     planned_for = Column(Date, nullable=True)
+    #: Heure prévue, facultative (tâche planifiée)
+    planned_time = Column(Time, nullable=True)
     #: Date réelle : remplie seulement quand la tâche est faite
     performed_at = Column(DateTime(timezone=True), nullable=True)
     #: Équipe chargée de la tâche (code d'un type de tâche), facultative
