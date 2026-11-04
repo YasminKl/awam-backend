@@ -14,6 +14,7 @@ on peut donc relancer une synchronisation sans risque de doublon.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, timedelta
 
 import httpx
@@ -88,43 +89,83 @@ def farm_coordinates(db: Session, farm_id: int | None = None) -> list[dict]:
 # ======================================================================
 
 
+#: Une demande à Open-Meteo couvre au plus une année : une longue période
+#: (ex. 20 ans pour la projection climatique) est découpée en morceaux,
+#: pour que chaque réponse reste rapide
+MAX_DAYS_PER_REQUEST = 366
+
+#: Tentatives par morceau, et pauses (s) entre elles, en cas de lenteur,
+#: de coupure ou de surcharge passagère d'Open-Meteo (5xx, 429)
+FETCH_ATTEMPTS = 3
+RETRY_PAUSES_S = (2.0, 5.0)
+
+
+def _is_temporary(exc: Exception) -> bool:
+    """Erreur passagère : lenteur, coupure réseau, serveur surchargé."""
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500 or exc.response.status_code == 429
+    return False
+
+
+def _fetch_range(url: str, params: dict) -> dict:
+    """Une demande à Open-Meteo, avec de nouvelles tentatives si l'erreur est passagère."""
+    for attempt in range(FETCH_ATTEMPTS):
+        try:
+            with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
+                response = client.get(url, params=params)
+                response.raise_for_status()
+            return response.json().get("daily") or {}
+        except Exception as exc:  # noqa: BLE001 — on trie ci-dessous
+            if attempt == FETCH_ATTEMPTS - 1 or not _is_temporary(exc):
+                raise
+            pause = RETRY_PAUSES_S[min(attempt, len(RETRY_PAUSES_S) - 1)]
+            logger.warning(
+                "🌦️ [météo] Open-Meteo indisponible (%s), nouvelle tentative dans %.0f s",
+                exc.__class__.__name__, pause,
+            )
+            time.sleep(pause)
+    return {}
+
+
 def fetch_daily(
     latitude: float, longitude: float, start: date, end: date, *, archive: bool
 ) -> list[dict]:
     """
     Récupère la météo jour par jour entre `start` et `end` inclus.
 
+    Une longue période est demandée par morceaux d'une année au plus, et
+    chaque morceau est retenté en cas d'erreur passagère d'Open-Meteo.
+
     Returns:
         une liste de dicts {day, <colonnes de la table>}. Les jours sans
         aucune valeur (pas encore publiés) sont écartés.
     """
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
-        "daily": ",".join(DAILY_VARIABLES),
-        "timezone": "auto",
-    }
     url = ARCHIVE_URL if archive else FORECAST_URL
-
-    with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
-        response = client.get(url, params=params)
-        response.raise_for_status()
-
-    daily = response.json().get("daily") or {}
-    days = daily.get("time") or []
-
     rows = []
-    for i, day_str in enumerate(days):
-        row = {"day": date.fromisoformat(day_str)}
-        for variable, column in DAILY_VARIABLES.items():
-            values = daily.get(variable) or []
-            row[column] = values[i] if i < len(values) else None
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(end, chunk_start + timedelta(days=MAX_DAYS_PER_REQUEST - 1))
+        daily = _fetch_range(url, {
+            "latitude": latitude,
+            "longitude": longitude,
+            "start_date": chunk_start.isoformat(),
+            "end_date": chunk_end.isoformat(),
+            "daily": ",".join(DAILY_VARIABLES),
+            "timezone": "auto",
+        })
+        days = daily.get("time") or []
+        for i, day_str in enumerate(days):
+            row = {"day": date.fromisoformat(day_str)}
+            for variable, column in DAILY_VARIABLES.items():
+                values = daily.get(variable) or []
+                row[column] = values[i] if i < len(values) else None
 
-        if all(row[c] is None for c in DAILY_VARIABLES.values()):
-            continue
-        rows.append(row)
+            if all(row[c] is None for c in DAILY_VARIABLES.values()):
+                continue
+            rows.append(row)
+        chunk_start = chunk_end + timedelta(days=1)
     return rows
 
 
@@ -199,6 +240,67 @@ def sync_farm(db: Session, farm: dict, start: date, end: date) -> int:
             farm["latitude"], farm["longitude"], forecast_start, end, archive=False
         )
         written += upsert_days(db, farm, rows, "forecast")
+
+    db.commit()
+    return written
+
+
+def upsert_site_days(db: Session, site: dict, rows: list[dict], source: str) -> int:
+    """
+    Comme upsert_days, pour un LIEU ÉTUDIÉ par la projection climatique
+    (climate_site) : ses jours sont rangés dans la même table, avec site_id
+    au lieu de farm_id. Une valeur absente n'efface jamais une valeur connue.
+    """
+    columns = list(DAILY_VARIABLES.values())
+    updates = ",\n".join(
+        f"{c} = COALESCE(EXCLUDED.{c}, weather_daily.{c})" for c in columns
+    )
+
+    statement = text(f"""
+        INSERT INTO weather_daily (
+            site_id, day, {", ".join(columns)},
+            latitude, longitude, source
+        )
+        VALUES (
+            :site_id, :day, {", ".join(":" + c for c in columns)},
+            :latitude, :longitude, :source
+        )
+        ON CONFLICT (site_id, day) WHERE site_id IS NOT NULL DO UPDATE SET
+            {updates},
+            latitude = EXCLUDED.latitude,
+            longitude = EXCLUDED.longitude,
+            source = EXCLUDED.source,
+            updated_at = CURRENT_TIMESTAMP
+    """)
+
+    for row in rows:
+        db.execute(statement, {
+            **row,
+            "site_id": site["id"],
+            "latitude": site["latitude"],
+            "longitude": site["longitude"],
+            "source": source,
+        })
+    return len(rows)
+
+
+def sync_site(db: Session, site: dict, start: date, end: date) -> int:
+    """
+    Synchronise un lieu étudié entre `start` et `end` inclus, comme
+    sync_farm : l'archive pour les jours anciens, la prévision pour les
+    jours récents. Retourne le nombre de jours écrits.
+    """
+    archive_end = min(end, date.today() - timedelta(days=ARCHIVE_DELAY_DAYS))
+    written = 0
+
+    if start <= archive_end:
+        rows = fetch_daily(site["latitude"], site["longitude"], start, archive_end, archive=True)
+        written += upsert_site_days(db, site, rows, "archive")
+
+    forecast_start = max(start, archive_end + timedelta(days=1))
+    if forecast_start <= end:
+        rows = fetch_daily(site["latitude"], site["longitude"], forecast_start, end, archive=False)
+        written += upsert_site_days(db, site, rows, "forecast")
 
     db.commit()
     return written

@@ -9,6 +9,12 @@ Open-Meteo (variable `et0_fao_evapotranspiration`), ce qui évite de
 recalculer Penman-Monteith : la même formule, mais déjà appliquée aux
 données météo locales.
 
+La pluie et l'ET0 des derniers jours sont LUES dans weather_daily, déjà
+alimentée chaque matin par la tâche météo : aucune donnée en double, et
+aucun appel à Internet. Open-Meteo n'est interrogé qu'en secours, si la
+base n'a pas encore ces jours (ex. ferme toute nouvelle), avec de nouvelles
+tentatives en cas d'erreur passagère.
+
 Le résultat est donné en millimètres (1 mm = 1 litre/m²) puis converti
 en mètres cubes pour la parcelle, seule unité directement utilisable par
 l'agriculteur.
@@ -20,9 +26,11 @@ import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-import httpx
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.services.agronomy.water import get_kc_for_stages
+from app.services.open_meteo_client import get_json
 
 logger = logging.getLogger(__name__)
 
@@ -81,15 +89,33 @@ async def fetch_water_balance(
         "timezone": "auto",
     }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(OPEN_METEO_ARCHIVE, params=params, timeout=15.0)
-        response.raise_for_status()
-
-    daily = response.json().get("daily", {})
+    daily = (await get_json(OPEN_METEO_ARCHIVE, params, timeout=15.0)).get("daily", {})
     et0_values = [v for v in (daily.get("et0_fao_evapotranspiration") or []) if v is not None]
     rain_values = [v for v in (daily.get("precipitation_sum") or []) if v is not None]
 
     return sum(et0_values), sum(rain_values)
+
+
+def balance_from_weather_daily(
+    db: Session, farm_id: int, days: int = DEFAULT_WINDOW_DAYS, today: date | None = None
+) -> tuple[float, float] | None:
+    """
+    ET0 et pluie cumulées des N derniers jours, lues dans weather_daily.
+    Renvoie None s'il manque plus d'un jour : le bilan serait faussé.
+    """
+    end = today or date.today()
+    start = end - timedelta(days=days - 1)
+    row = db.execute(
+        text("""
+            SELECT COUNT(et0_mm) AS n, COALESCE(SUM(et0_mm), 0) AS et0, COALESCE(SUM(precipitation_mm), 0) AS rain
+            FROM weather_daily
+            WHERE farm_id = :farm_id AND day BETWEEN :start AND :end
+        """),
+        {"farm_id": farm_id, "start": start, "end": end},
+    ).fetchone()
+    if row is None or row.n < days - 1:
+        return None
+    return float(row.et0), float(row.rain)
 
 
 def compute_water_need(
@@ -154,15 +180,22 @@ async def get_water_need(
     longitude: float,
     area_ha: float | None = None,
     days: int = DEFAULT_WINDOW_DAYS,
+    db: Session | None = None,
+    farm_id: int | None = None,
 ) -> WaterNeed | None:
     """
-    Bilan hydrique complet : interroge la météo puis applique le Kc.
-    Renvoie None si la météo est indisponible.
+    Bilan hydrique complet : la météo des derniers jours (weather_daily,
+    sinon Open-Meteo en secours), puis le Kc. Renvoie None si la météo est
+    indisponible partout.
     """
-    try:
-        et0_mm, rain_mm = await fetch_water_balance(latitude, longitude, days)
-    except Exception as e:
-        logger.warning("[eau] Météo indisponible pour le bilan hydrique : %s", e)
-        return None
+    balance = balance_from_weather_daily(db, farm_id, days) if db is not None and farm_id else None
+    if balance is not None:
+        et0_mm, rain_mm = balance
+    else:
+        try:
+            et0_mm, rain_mm = await fetch_water_balance(latitude, longitude, days)
+        except Exception as e:
+            logger.warning("[eau] Météo indisponible pour le bilan hydrique : %s", e)
+            return None
 
     return compute_water_need(species, stage, et0_mm, rain_mm, area_ha, days)

@@ -21,6 +21,7 @@ celery_app = Celery(
         "app.tasks.ingestion_tasks",   # 🆕 14 indices spectraux
         "app.tasks.weather_tasks",     # 🆕 historique météo
         "app.tasks.history_tasks",     # 🆕 historique Sentinel-2 sur 3 ans
+                "app.tasks.climate_tasks",     # 🆕 projection climatique
     ],
 )
 
@@ -35,10 +36,13 @@ celery_app.conf.update(
 )
 
 # ------------------------------------------------------------------
-# SSL (Upstash exige TLS)
+# SSL : seulement pour une adresse « rediss:// » (ex. Upstash, qui exige
+# TLS). Un Redis local (« redis:// », ex. dans le conteneur de production)
+# n'en a pas besoin, et refuserait la connexion.
 # ------------------------------------------------------------------
-celery_app.conf.broker_use_ssl = {"ssl_cert_reqs": ssl.CERT_NONE}
-celery_app.conf.redis_backend_use_ssl = {"ssl_cert_reqs": ssl.CERT_NONE}
+if REDIS_URL.startswith("rediss://"):
+    celery_app.conf.broker_use_ssl = {"ssl_cert_reqs": ssl.CERT_NONE}
+    celery_app.conf.redis_backend_use_ssl = {"ssl_cert_reqs": ssl.CERT_NONE}
 
 # ------------------------------------------------------------------
 # Reconnexion (Upstash ferme les connexions inactives après quelques
@@ -100,6 +104,7 @@ celery_app.conf.task_routes = {
     "app.tasks.ingestion_tasks.*": {"queue": "awam_queues:parcelles"},  # 🆕
     "weather.*": {"queue": "awam_queues:parcelles"},  # 🆕 météo
     "history.*": {"queue": "awam_queues:historique"},  # 🆕 historique, worker dédié
+    "climate.*": {"queue": "awam_queues:historique"},  # 🆕 climat : traitements longs
 
 }
 
@@ -140,6 +145,31 @@ celery_app.conf.beat_schedule = {
         },
     },
 
+
+        # ------------------------------------------------------------------
+    # Projection climatique (worker historique)
+    #   - h45 : les lieux encore « en attente » sont lancés ;
+    #   - le 5 du mois : climat réel du mois écoulé (ERA5 publie un mois
+    #     avec quelques jours de retard) ;
+    #   - le 20 janvier : correction des biais recalculée avec les
+    #     dernières années réelles.
+    # ------------------------------------------------------------------
+    "climate-check-pending": {
+        "task": "climate.check_pending",
+        "schedule": crontab(minute=45),
+        "options": {"queue": "awam_queues:historique", "expires": 3000},
+    },
+    "climate-update-real-monthly": {
+        "task": "climate.update_real_monthly",
+        "schedule": crontab(day_of_month=5, hour=7, minute=0),
+        "options": {"queue": "awam_queues:historique"},
+    },
+    "climate-recompute-yearly": {
+        "task": "climate.recompute_yearly",
+        "schedule": crontab(month_of_year=1, day_of_month=20, hour=4, minute=0),
+        "options": {"queue": "awam_queues:historique"},
+    },
+    
     # ------------------------------------------------------------------
     # Recherche des nouvelles images et calcul des 15 indices
     # Toutes les 3 heures, de 6h à 21h (6h, 9h, 12h, 15h, 18h, 21h, heure

@@ -273,7 +273,7 @@ async def get_crop_needs(
 
     row = db.execute(
         text("""
-            SELECT f.latitude, f.longitude,
+            SELECT f.id AS farm_id, f.latitude, f.longitude,
                    ST_Area(p.geom::geography) / 10000.0 AS area_ha
             FROM parcel p JOIN farm f ON f.id = p.farm_id
             WHERE p.id = :pid
@@ -293,6 +293,8 @@ async def get_crop_needs(
             species=crop.species, stage=stages,
             latitude=row.latitude, longitude=row.longitude,
             area_ha=row.area_ha,
+            # La météo des derniers jours est lue en base, sans appel extérieur
+            db=db, farm_id=row.farm_id,
         )
         if need:
             water = WaterNeedResponse(**need.__dict__)

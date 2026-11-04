@@ -61,6 +61,9 @@ from app.api.routes.crops import router as crops_router
 from app.api.routes.diagnosis import router as diagnosis_router
 from app.api.routes.events import router as events_router
 from app.api.routes.task_types import router as task_types_router
+from app.api.routes.climate import router as climate_router
+from app.api.routes.irrigation import router as irrigation_router
+
 
 print("🔵 Lancement de l'application FastAPI...")
 
@@ -146,6 +149,10 @@ app.include_router(events_router, prefix="/api")
 
 print("🔵 Ajout du router task...")
 app.include_router(task_types_router, prefix="/api")
+
+print("🔵 Ajout du router climat...")
+
+app.include_router(climate_router, prefix="/api")
 # ==================================================================
 # Titiler
 # ==================================================================
@@ -163,6 +170,9 @@ app.include_router(
     tags=["COG"],
     dependencies=[Depends(get_current_user)],
 )
+
+print("🔵 Ajout d'irrigation task...")
+app.include_router(irrigation_router, prefix="/api")
 
 print("✅ Application prête !")
 

@@ -38,7 +38,7 @@ HISTORY_START = date(2026, 1, 1)
 def _last_stored_days(db) -> dict[int, date]:
     """Dernier jour enregistré pour chaque ferme qui a déjà des données."""
     rows = db.execute(
-        text("SELECT farm_id, MAX(day) AS last_day FROM weather_daily GROUP BY farm_id")
+        text("SELECT farm_id, MAX(day) AS last_day FROM weather_daily WHERE farm_id IS NOT NULL GROUP BY farm_id")
     ).fetchall()
 
     last_days = {}

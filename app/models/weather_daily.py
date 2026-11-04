@@ -1,9 +1,11 @@
 """
 Modèle SQLAlchemy pour la table `weather_daily`.
 
-Historique météo quotidien par ferme, issu d'Open-Meteo.
+Historique météo quotidien, issu d'Open-Meteo, pour une ferme OU pour un
+lieu étudié par la projection climatique (climate_site) : c'est la seule
+source de la météo réelle quotidienne, le climat ne la recopie pas.
 
-Une ligne = (ferme, jour). La météo est stockée par ferme et non par
+Une ligne = (ferme, jour) ou (lieu étudié, jour). La météo est stockée par ferme et non par
 parcelle : les données ont une maille d'environ 10 km, toutes les
 parcelles d'une même ferme auraient donc les mêmes valeurs.
 
@@ -13,35 +15,50 @@ Table alimentée par :
 """
 
 from sqlalchemy import (
+    CheckConstraint,
     Column,
     Integer,
     String,
     Float,
     Date,
+    Index,
     DateTime,
     ForeignKey,
     UniqueConstraint,
 )
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 
 from app.db.database import Base
 
 
 class WeatherDaily(Base):
-    """Météo d'une journée pour une ferme."""
+    """Météo d'une journée pour une ferme, ou pour un lieu étudié."""
 
     __tablename__ = "weather_daily"
 
     __table_args__ = (
         UniqueConstraint("farm_id", "day", name="uq_weather_daily_farm_day"),
+        # Un seul jour par lieu étudié
+        Index("uq_weather_daily_site_day", "site_id", "day", unique=True, postgresql_where=text("site_id IS NOT NULL")),
+        # Une ligne appartient à une ferme OU à un lieu étudié, jamais aux deux
+        CheckConstraint("(farm_id IS NOT NULL) <> (site_id IS NOT NULL)", name="ck_weather_daily_owner"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
 
+    #: Ferme ; vide pour un lieu étudié
     farm_id = Column(
         Integer,
         ForeignKey("farm.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+
+    #: Lieu étudié par la projection climatique ; vide pour une ferme
+    site_id = Column(
+        Integer,
+        ForeignKey("climate_site.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
 

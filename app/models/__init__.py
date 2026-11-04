@@ -13,10 +13,10 @@ from app.models.crop import Crop
 from app.models.crop_observation import CropObservation
 from app.models.crop_diagnosis import CropDiagnosis
 from app.models.weather_daily import *
-
+from app.models.climate import *
+from app.models.irrigation_equipment import *
 __all__ = [
     "User", "Farm", "Parcel", "Activity",
-    "Employee", "Alert", "IndiceReading",
-    "Raster", "SpatialReference",
-        "Crop", "CropObservation", "CropDiagnosis",
+    "Employee", "Alert", "IndiceReading", "IrrigationEquipment",
+    "Raster", "SpatialReference", "Crop", "CropObservation", "CropDiagnosis", "ClimateSite", "ClimateMonthly",
 ]
