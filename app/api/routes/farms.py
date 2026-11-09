@@ -50,7 +50,22 @@ async def create_farm(
     )
     db.commit()
     row = result.fetchone()
+
+    # Ferme créée avec sa position : son historique météo depuis 2020 est
+    # récupéré tout de suite, en arrière-plan (sinon, à sa première parcelle)
+    if payload.latitude is not None and payload.longitude is not None:
+        _launch_weather_history(row.id)
     return dict(row._mapping)
+
+
+def _launch_weather_history(farm_id: int) -> None:
+    """Historique météo de la ferme en arrière-plan ; une panne ne bloque rien."""
+    try:
+        from app.tasks.weather_tasks import launch_farm_history
+
+        launch_farm_history(farm_id)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @router.put("/{farm_id}", response_model=FarmResponse)

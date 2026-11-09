@@ -9,9 +9,9 @@ Exemples, dans .env :
 
     CLIMATE_START_YEAR=2020
     CLIMATE_END_YEAR=2040
-    CLIMATE_BASELINE_START=1995
-    CLIMATE_BASELINE_END=2014
-    CLIMATE_SLIDING_YEARS=20
+    CLIMATE_BASELINE_START=2015
+    CLIMATE_BASELINE_END=2025
+    CLIMATE_SLIDING_YEARS=11
     CLIMATE_SCENARIOS=ssp2_4_5,ssp5_8_5
     CLIMATE_MODELS=ec_earth3_cc,mpi_esm1_2_lr
     CLIMATE_AREA_MARGIN=2.0
@@ -65,15 +65,20 @@ CDS_KEY = os.getenv("CDSAPI_KEY", "")
 START_YEAR = _int("CLIMATE_START_YEAR", 2020)
 END_YEAR = _int("CLIMATE_END_YEAR", 2040)
 
-#: Période de référence de la correction des biais : celle du 6e rapport
-#: du GIEC (1995-2014), qui coïncide avec la fin des simulations
-#: « historical » des modèles CMIP6 (2014)
-BASELINE_START = _int("CLIMATE_BASELINE_START", 1995)
-BASELINE_END = _int("CLIMATE_BASELINE_END", 2014)
+#: Période de référence de la correction des biais : 2015-2025, 11 ans.
+#: Compromis retenu pour réduire les demandes à Copernicus : ces années sont
+#: couvertes par les simulations des scénarios (qui commencent en 2015), il
+#: n'y a donc rien à demander à la simulation « historical » (5 demandes de
+#: moins). Le GIEC (6e rapport) utilise 1995-2014, 20 ans : 11 ans suffisent
+#: à lisser les années extrêmes, mais la correction de la pluie est moins
+#: robuste qu'avec 20 ans.
+BASELINE_START = _int("CLIMATE_BASELINE_START", 2015)
+BASELINE_END = _int("CLIMATE_BASELINE_END", 2025)
 
 #: Recalcul annuel de la correction : sur les N dernières années complètes
-#: (fenêtre glissante), pour tenir compte du climat réel le plus récent
-SLIDING_YEARS = _int("CLIMATE_SLIDING_YEARS", 20)
+#: (fenêtre glissante), pour tenir compte du climat réel le plus récent.
+#: Même durée que la référence : les projections sont gardées depuis 2015.
+SLIDING_YEARS = _int("CLIMATE_SLIDING_YEARS", 11)
 
 #: Dernière année des simulations « historical » de CMIP6 ; ensuite, les
 #: modèles suivent les scénarios
@@ -107,6 +112,19 @@ PERIOD_YEARS = _int("CLIMATE_PERIOD_YEARS", 5)
 #: Demi-largeur de la zone téléchargée autour d'un lieu, en degrés : assez
 #: large pour contenir de la mer et quelques mailles des modèles
 AREA_MARGIN = _float("CLIMATE_AREA_MARGIN", 2.0)
+
+
+#: Les zones demandées sont centrées sur une grille de ce pas (degrés) :
+#: deux lieux proches (même case de la grille) demandent exactement la même
+#: zone, et le fichier reçu une fois sert aux deux (voir CACHE_DIR)
+AREA_GRID = _float("CLIMATE_AREA_GRID", 0.5)
+
+#: Dossier où les fichiers reçus de Copernicus sont gardés, pour être
+#: réutilisés par les lieux proches sans nouvelle demande
+CACHE_DIR = os.getenv("CLIMATE_CACHE_DIR", "data/climate_cache")
+
+if AREA_GRID <= 0 or AREA_GRID > AREA_MARGIN:
+    raise ValueError("CLIMATE_AREA_GRID doit être positif et ne pas dépasser CLIMATE_AREA_MARGIN")
 
 # ----------------------------------------------------------------------
 # Jeux de données Copernicus
@@ -148,7 +166,9 @@ class ClimateVariable:
     #: Le climat réel de cette variable vient de weather_daily (Open-Meteo),
     #: et non d'ERA5 : il n'est pas recopié dans climate_monthly
     from_weather_daily: bool = False
-
+    #: Projection CMIP6 non demandée : calculée à partir des températures
+    #: maximale et minimale, (max + min) / 2, une demande de moins par période
+    cmip6_from_minmax: bool = False
 
 #: Les variables de la projection climatique
 CLIMATE_VARIABLES: list[ClimateVariable] = [
@@ -162,7 +182,7 @@ CLIMATE_VARIABLES: list[ClimateVariable] = [
         "air_temperature_c", "Température de l'air", "°C",
         "2m_temperature", ("t2m",), "kelvin_to_c",
         "near_surface_air_temperature", ("tas",), "kelvin_to_c",
-        from_weather_daily=True,
+        from_weather_daily=True, cmip6_from_minmax=True,
     ),
     ClimateVariable(
         "air_temperature_max_c", "Température maximale (pour ET₀)", "°C",
@@ -192,6 +212,8 @@ CLIMATE_VARIABLES: list[ClimateVariable] = [
 #: Variables dont le climat réel vient d'ERA5 (et non de weather_daily)
 ERA5_STORED_VARIABLES = [v for v in CLIMATE_VARIABLES if not v.from_weather_daily]
 
+#: Variables demandées à CMIP6 (la température moyenne est calculée)
+CMIP6_DOWNLOADED_VARIABLES = [v for v in CLIMATE_VARIABLES if not v.cmip6_from_minmax]
 
 def middle_year() -> int:
     """Une année au milieu de la période : utile pour tester les projections."""

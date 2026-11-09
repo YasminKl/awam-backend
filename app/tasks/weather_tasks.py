@@ -23,7 +23,7 @@ from datetime import date, timedelta
 from sqlalchemy import text
 
 from app.db.database import SessionLocal
-from app.services.weather_history_service import farm_coordinates, sync_farm
+from app.services.weather_history_service import farm_coordinates, fetch_forecast, save_forecast, sync_farm
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ RECENT_WINDOW_DAYS = 7
 
 #: Début de l'historique pour une ferme qui n'a encore aucune donnée
 #: (même date par défaut que le script backfill_weather)
-HISTORY_START = date(2026, 1, 1)
+HISTORY_START = date(2020, 1, 1)
 
 
 def _last_stored_days(db) -> dict[int, date]:
@@ -85,6 +85,7 @@ def sync_recent_weather(days: int = RECENT_WINDOW_DAYS) -> dict:
         "failed": 0,
         "caught_up": 0,
         "days_written": 0,
+        "forecasts": 0,
     }
 
     db = SessionLocal()
@@ -120,7 +121,18 @@ def sync_recent_weather(days: int = RECENT_WINDOW_DAYS) -> dict:
                 logger.exception(
                     "⚠️ [météo] Échec pour la ferme %s (%s)", farm["id"], farm["name"]
                 )
-
+            
+            # Prévisions des prochains jours : une panne n'empêche pas la suite
+            try:
+                saved = save_forecast(db, farm, fetch_forecast(farm["latitude"], farm["longitude"]))
+                summary["forecasts"] += 1
+                logger.info("🌦️ [météo] Ferme %s (%s) : %d jours de prévision", farm["id"], farm["name"], saved)
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                logger.warning(
+                    "⚠️ [météo] Prévisions indisponibles pour la ferme %s (%s) : %s",
+                    farm["id"], farm["name"], exc,
+                )
         logger.info(
             "🏁 [météo] Terminé jusqu'au %s : %d fermes OK, %d en échec, "
             "%d rattrapées, %d jours écrits",
@@ -132,7 +144,40 @@ def sync_recent_weather(days: int = RECENT_WINDOW_DAYS) -> dict:
     finally:
         db.close()
 
-
+def sync_farm_history(farm_id: int, today: date | None = None) -> dict:
+    """
+    Récupère tout de suite l'historique météo d'UNE ferme, sans attendre la
+    tâche du matin : depuis HISTORY_START pour une ferme sans données, sinon
+    seulement les jours manquants. Puis ses prévisions des prochains jours.
+    Lancée à la création d'une ferme (avec sa position) ou d'une parcelle.
+    """
+    yesterday = (today or date.today()) - timedelta(days=1)
+    summary = {"farm_id": farm_id, "days_written": 0, "forecast": False, "skipped": False}
+    db = SessionLocal()
+    try:
+        farms = farm_coordinates(db, farm_id)
+        if not farms:
+            summary["skipped"] = True
+            logger.info("🌦️ [météo] Ferme %s : ni position ni parcelle, historique remis à plus tard", farm_id)
+            return summary
+        farm = farms[0]
+        last_day = _last_stored_days(db).get(farm_id)
+        start = HISTORY_START if last_day is None else last_day + timedelta(days=1)
+        if start <= yesterday:
+            summary["days_written"] = sync_farm(db, farm, start, yesterday)
+        try:
+            save_forecast(db, farm, fetch_forecast(farm["latitude"], farm["longitude"]))
+            summary["forecast"] = True
+        except Exception as exc:  # noqa: BLE001 — la tâche du matin réessaiera
+            db.rollback()
+            logger.warning("⚠️ [météo] Prévisions indisponibles pour la ferme %s : %s", farm_id, exc)
+        logger.info(
+            "🌦️ [météo] Ferme %s (%s) : historique à jour, %d jours enregistrés (%s → %s)",
+            farm_id, farm["name"], summary["days_written"], start, yesterday,
+        )
+        return summary
+    finally:
+        db.close()
 # ======================================================================
 # Wrapper Celery
 # ======================================================================
@@ -153,9 +198,41 @@ try:
             logger.exception("❌ [celery] Échec synchronisation météo")
             raise self.retry(exc=exc, countdown=600)
 
+    @celery_app.task(
+        name="weather.sync_farm_history",
+        bind=True,
+        max_retries=3,
+    )
+    def sync_farm_history_task(self, farm_id: int) -> dict:
+        """Version Celery de `sync_farm_history`. Retry auto 3 fois, toutes les 5 min."""
+        try:
+            return sync_farm_history(farm_id)
+        except Exception as exc:
+            logger.exception("❌ [celery] Échec de l'historique météo de la ferme %s", farm_id)
+            raise self.retry(exc=exc, countdown=300)
+
 except ImportError as e:
     sync_weather_daily_task = None
+    sync_farm_history_task = None
     logger.error(
         "❌ Celery non configuré (%s) : `sync_weather_daily_task` "
         "indisponible. Utilisez `sync_recent_weather()` en synchrone.", e
     )
+
+    
+
+def launch_farm_history(farm_id: int, countdown: int = 10) -> bool:
+    """
+    Lance en arrière-plan la récupération de l'historique météo d'une ferme.
+    Si Celery ou Redis est indisponible, rien n'est bloqué : la tâche du
+    matin rattrapera l'historique. Retourne True si la tâche est lancée.
+    """
+    if sync_farm_history_task is None:
+        return False
+    try:
+        sync_farm_history_task.apply_async(args=[farm_id], countdown=countdown)
+        logger.info("🌦️ [météo] Historique de la ferme %s programmé", farm_id)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("⚠️ [météo] Historique de la ferme %s non programmé : la tâche du matin le rattrapera", farm_id)
+        return False

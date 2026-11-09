@@ -39,7 +39,13 @@ DAILY_VARIABLES: dict[str, str] = {
     "et0_fao_evapotranspiration": "et0_mm",
     "wind_speed_10m_max": "wind_speed_max_kmh",
     "shortwave_radiation_sum": "radiation_mj_m2",
+    "temperature_2m_mean": "temperature_mean_c",
+    "relative_humidity_2m_mean": "humidity_mean_pct",
+    "wind_speed_10m_mean": "wind_speed_mean_kmh",
 }
+
+#: Nombre de jours de prévision gardés (aujourd'hui compris), pour les alertes
+FORECAST_DAYS = 7
 
 
 # ======================================================================
@@ -99,6 +105,10 @@ MAX_DAYS_PER_REQUEST = 366
 FETCH_ATTEMPTS = 3
 RETRY_PAUSES_S = (2.0, 5.0)
 
+#: Limite de demandes par minute d'Open-Meteo (erreur 429) : on attend la
+#: minute suivante avant de réessayer
+RATE_LIMIT_PAUSE_S = 61.0
+
 
 def _is_temporary(exc: Exception) -> bool:
     """Erreur passagère : lenteur, coupure réseau, serveur surchargé."""
@@ -120,7 +130,8 @@ def _fetch_range(url: str, params: dict) -> dict:
         except Exception as exc:  # noqa: BLE001 — on trie ci-dessous
             if attempt == FETCH_ATTEMPTS - 1 or not _is_temporary(exc):
                 raise
-            pause = RETRY_PAUSES_S[min(attempt, len(RETRY_PAUSES_S) - 1)]
+            rate_limited = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
+            pause = RATE_LIMIT_PAUSE_S if rate_limited else RETRY_PAUSES_S[min(attempt, len(RETRY_PAUSES_S) - 1)]
             logger.warning(
                 "🌦️ [météo] Open-Meteo indisponible (%s), nouvelle tentative dans %.0f s",
                 exc.__class__.__name__, pause,
@@ -155,18 +166,63 @@ def fetch_daily(
             "daily": ",".join(DAILY_VARIABLES),
             "timezone": "auto",
         })
-        days = daily.get("time") or []
-        for i, day_str in enumerate(days):
-            row = {"day": date.fromisoformat(day_str)}
-            for variable, column in DAILY_VARIABLES.items():
-                values = daily.get(variable) or []
-                row[column] = values[i] if i < len(values) else None
-
-            if all(row[c] is None for c in DAILY_VARIABLES.values()):
-                continue
-            rows.append(row)
+        rows.extend(_rows_from_daily(daily))
         chunk_start = chunk_end + timedelta(days=1)
     return rows
+
+
+def _rows_from_daily(daily: dict) -> list[dict]:
+    """Les jours d'une réponse Open-Meteo ; les jours sans aucune valeur sont écartés."""
+    rows = []
+    for i, day_str in enumerate(daily.get("time") or []):
+        row = {"day": date.fromisoformat(day_str)}
+        for variable, column in DAILY_VARIABLES.items():
+            values = daily.get(variable) or []
+            row[column] = values[i] if i < len(values) else None
+        if all(row[c] is None for c in DAILY_VARIABLES.values()):
+            continue
+        rows.append(row)
+    return rows
+
+
+# ======================================================================
+# Prévisions des prochains jours
+# ======================================================================
+
+
+def fetch_forecast(latitude: float, longitude: float, days: int = FORECAST_DAYS) -> list[dict]:
+    """
+    Les prévisions d'Open-Meteo pour les `days` prochains jours, aujourd'hui
+    compris. Elles servent aux alertes (gel, forte chaleur annoncés) ; elles
+    ne sont JAMAIS mélangées au climat réel de weather_daily.
+    """
+    daily = _fetch_range(FORECAST_URL, {
+        "latitude": latitude,
+        "longitude": longitude,
+        "daily": ",".join(DAILY_VARIABLES),
+        "forecast_days": days,
+        "timezone": "auto",
+    })
+    return _rows_from_daily(daily)
+
+
+def save_forecast(db: Session, farm: dict, rows: list[dict], today: date | None = None) -> int:
+    """
+    Remplace les prévisions d'une ferme par les nouvelles : une ferme n'a
+    que les prévisions du dernier passage, à partir d'aujourd'hui.
+    """
+    today = today or date.today()
+    columns = list(DAILY_VARIABLES.values())
+    db.execute(text("DELETE FROM weather_forecast WHERE farm_id = :f"), {"f": farm["id"]})
+    statement = text(f"""
+        INSERT INTO weather_forecast (farm_id, day, {", ".join(columns)})
+        VALUES (:farm_id, :day, {", ".join(":" + c for c in columns)})
+    """)
+    kept = [r for r in rows if r["day"] >= today]
+    for row in kept:
+        db.execute(statement, {**dict.fromkeys(columns), **row, "farm_id": farm["id"]})
+    db.commit()
+    return len(kept)
 
 
 # ======================================================================
@@ -205,6 +261,7 @@ def upsert_days(
 
     for row in rows:
         db.execute(statement, {
+            **dict.fromkeys(columns),  # une valeur absente est enregistrée vide
             **row,
             "farm_id": farm["id"],
             "latitude": farm["latitude"],
@@ -275,6 +332,7 @@ def upsert_site_days(db: Session, site: dict, rows: list[dict], source: str) -> 
 
     for row in rows:
         db.execute(statement, {
+            **dict.fromkeys(columns),  # une valeur absente est enregistrée vide
             **row,
             "site_id": site["id"],
             "latitude": site["latitude"],

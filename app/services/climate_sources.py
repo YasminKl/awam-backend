@@ -8,6 +8,8 @@ climatique.
 """
 
 import calendar
+import hashlib
+import json
 import logging
 import re
 import zipfile
@@ -57,10 +59,22 @@ ALL_MONTHS = list(range(1, 13))
 # ----------------------------------------------------------------------
 
 
+def snap(value: float) -> float:
+    """Centre de la case de la grille (pas AREA_GRID) qui contient la valeur."""
+    step = cfg.AREA_GRID
+    return round(round(value / step) * step, 4)
+
+
 def area(lat: float, lon: float) -> list[float]:
-    """Zone [nord, ouest, sud, est] autour du lieu."""
+    """
+    Zone [nord, ouest, sud, est] autour du lieu, centrée sur la grille
+    AREA_GRID : les lieux proches demandent ainsi la MÊME zone, et le
+    fichier reçu une fois sert à tous (cache). Le lieu reste à moins d'une
+    demi-case du centre, bien à l'intérieur de la zone (marge AREA_MARGIN).
+    """
     m = cfg.AREA_MARGIN
-    return [round(lat + m, 2), round(lon - m, 2), round(lat - m, 2), round(lon + m, 2)]
+    clat, clon = snap(lat), snap(lon)
+    return [round(clat + m, 2), round(clon - m, 2), round(clat - m, 2), round(clon + m, 2)]
 
 
 def era5_request(var: ClimateVariable, year: int, months: list[int], lat: float, lon: float) -> tuple[str, dict]:
@@ -91,6 +105,23 @@ def era5_monthly_request(
         "variable": [var.era5],
         "year": [str(y) for y in years],
         "month": [f"{m:02d}" for m in months],
+        "time": ["00:00"],
+        "area": area(lat, lon),
+        "data_format": "netcdf",
+        "download_format": "unarchived",
+    }
+
+def era5_surfaces_request(years: list[int], lat: float, lon: float) -> tuple[str, dict]:
+    """
+    UNE demande ERA5 mensuelle pour toutes les températures de surface (terre
+    et mer) et toutes les années : Copernicus accepte plusieurs variables et
+    plusieurs années dans une même demande.
+    """
+    return cfg.ERA5_MONTHLY, {
+        "product_type": ["monthly_averaged_reanalysis"],
+        "variable": [v.era5 for v in cfg.ERA5_STORED_VARIABLES],
+        "year": [str(y) for y in years],
+        "month": [f"{m:02d}" for m in ALL_MONTHS],
         "time": ["00:00"],
         "area": area(lat, lon),
         "data_format": "netcdf",
@@ -255,6 +286,48 @@ def values_at(
     return [(y, m, v) for (y, m), v in sorted(results.items())]
 
 
+def cache_key(dataset: str, request: dict) -> str:
+    """Identifiant stable d'une demande : même jeu et mêmes paramètres, même clé."""
+    text = json.dumps({"dataset": dataset, "request": request}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def cached_download(client, dataset: str, request: dict) -> Path:
+    """
+    Le fichier d'une demande : celui déjà reçu (même zone, même période, même
+    variable), sinon un nouveau téléchargement, gardé pour la suite. Le
+    fichier n'est rangé qu'une fois complet : un téléchargement interrompu
+    n'est jamais pris pour un fichier valide.
+    """
+    folder = Path(cfg.CACHE_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{cache_key(dataset, request)}.download"
+    if target.exists() and target.stat().st_size > 0:
+        logger.info("           Copernicus : déjà reçu pour ce secteur, fichier réutilisé")
+        return target
+    partial = target.with_suffix(".part")
+    client.retrieve(dataset, request, str(partial))
+    partial.replace(target)
+    return target
+
+def retrieve_era5_surfaces(
+    client, dataset: str, request: dict, lat: float, lon: float, workdir: Path, meta: dict | None = None,
+) -> dict[str, list[tuple[int, int, float]]]:
+    """
+    Télécharge UNE demande ERA5 à plusieurs variables, puis lit chaque
+    variable au lieu (la mer, à la maille de mer la plus proche).
+    """
+    files = netcdf_files(cached_download(client, dataset, request), workdir)
+    out: dict[str, list[tuple[int, int, float]]] = {}
+    for var in cfg.ERA5_STORED_VARIABLES:
+        to_unit = CONVERSIONS[var.era5_convert]
+        out[var.key] = [
+            (y, m, to_unit(v, y, m))
+            for y, m, v in values_at(files, var.era5_file, lat, lon, var.sea, meta if var.sea else None)
+        ]
+    return out
+
+    
 def retrieve_values(
     client, dataset: str, request: dict, file_names: tuple, convert: str, sea: bool, lat: float, lon: float, workdir: Path,
     meta: dict | None = None,
@@ -264,8 +337,7 @@ def retrieve_values(
     (année, mois, valeur en °C ou en mm). Lève l'erreur de Copernicus
     telle quelle si la demande est refusée.
     """
-    target = workdir / f"{abs(hash((dataset, repr(sorted(request.items())))))}.download"
-    client.retrieve(dataset, request, str(target))
+    target = cached_download(client, dataset, request)
     to_unit = CONVERSIONS[convert]
     return [
         (y, m, to_unit(v, y, m))

@@ -78,6 +78,12 @@ class WeatherDaily(Base):
     wind_speed_max_kmh = Column(Float, nullable=True)
     #: Rayonnement solaire cumulé (MJ/m²)
     radiation_mj_m2 = Column(Float, nullable=True)
+        #: Température moyenne de la journée (°C)
+    temperature_mean_c = Column(Float, nullable=True)
+    #: Humidité relative moyenne de l'air (%)
+    humidity_mean_pct = Column(Float, nullable=True)
+    #: Vent moyen à 10 m (km/h)
+    wind_speed_mean_kmh = Column(Float, nullable=True)
 
     # ==================================================================
     # Traçabilité

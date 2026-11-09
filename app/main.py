@@ -63,7 +63,7 @@ from app.api.routes.events import router as events_router
 from app.api.routes.task_types import router as task_types_router
 from app.api.routes.climate import router as climate_router
 from app.api.routes.irrigation import router as irrigation_router
-
+from app.api.routes.conditions import router as conditions_router
 
 print("🔵 Lancement de l'application FastAPI...")
 
@@ -151,8 +151,13 @@ print("🔵 Ajout du router task...")
 app.include_router(task_types_router, prefix="/api")
 
 print("🔵 Ajout du router climat...")
-
 app.include_router(climate_router, prefix="/api")
+
+print("🔵 Ajout du router irrigation...")
+app.include_router(irrigation_router, prefix="/api")
+
+print("🔵 Ajout du router conditions...")
+app.include_router(conditions_router, prefix="/api")
 # ==================================================================
 # Titiler
 # ==================================================================

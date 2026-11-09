@@ -372,14 +372,56 @@ def download_era5_surfaces(
     return out
 
 
+def download_era5_surfaces_once(
+    client, site: ClimateSite, years: list[int], workdir: Path,
+) -> dict[str, Series]:
+    """
+    Températures de surface réelles (terre ET mer), ERA5 mensuel, pour toutes
+    les années demandées, en UNE seule demande à Copernicus. Mesure au
+    passage la distance du lieu à la mer, si elle n'est pas encore connue.
+    """
+    if not years:
+        return {}
+    dataset, request = src.era5_surfaces_request(years, site.latitude, site.longitude)
+    meta: dict = {}
+    label = f"ERA5 · températures de surface, terre et mer ({min(years)}-{max(years)})"
+    since = _progress.step(label) if _progress else None
+    values = src.retrieve_era5_surfaces(client, dataset, request, site.latitude, site.longitude, workdir, meta)
+    if _progress and since is not None:
+        _progress.finished(since)
+    if site.sea_distance_km is None and "distance_km" in meta:
+        site.sea_distance_km = meta["distance_km"]
+    return {key: {(y, m): v for y, m, v in series} for key, series in values.items()}
+
+
+def store_surfaces(db: Session, site: ClimateSite, surfaces: dict[str, Series], first: int, last: int) -> int:
+    """Enregistre les températures de surface réelles des années first à last."""
+    months: dict[tuple[int, int], dict[str, float | None]] = {}
+    for key, series in surfaces.items():
+        for (y, m), v in series.items():
+            if first <= y <= last:
+                months.setdefault((y, m), {})[key] = round(v, 3)
+    written = upsert_months(db, site.id, SOURCE_ERA5, "", "", False, months)
+    if months:
+        last_month = date(*max(months), 1)
+        if site.era5_until is None or last_month > site.era5_until:
+            site.era5_until = last_month
+    db.commit()
+    return written
+
+
 def download_cmip6(
     client, lat: float, lon: float, model: str, experiment: str, years: list[int], workdir: Path
 ) -> dict[str, Series]:
-    """Les 6 variables d'un modèle, pour une expérience (« historical » ou un scénario)."""
+    """
+    Les variables d'un modèle, pour une expérience (« historical » ou un
+    scénario). La température moyenne n'est pas demandée : elle est calculée,
+    (max + min) / 2, une demande de moins par période.
+    """
     out: dict[str, Series] = {}
     if not years:
         return out
-    for var in cfg.CLIMATE_VARIABLES:
+    for var in cfg.CMIP6_DOWNLOADED_VARIABLES:
         dataset, request = src.cmip6_years_request(var, model, experiment, years, src.ALL_MONTHS, lat, lon)
         values = _retrieve(
             f"CMIP6 {model} {experiment} · {var.label}",
@@ -462,20 +504,41 @@ def load_raw_series(db: Session, site_id: int, model: str, scenario: str) -> dic
     return dict(series)
 
 
+def scenario_mean(raws: list[dict[str, Series]]) -> dict[str, Series]:
+    """
+    Moyenne des scénarios d'un modèle, mois par mois : le « modèle » de la
+    période de référence. Sur 2015-2025, les scénarios ne diffèrent que par
+    le hasard de leurs simulations ; leur moyenne en est la meilleure image.
+    """
+    out: dict[str, Series] = {}
+    keys = {k for raw in raws for k in raw}
+    for key in keys:
+        series = [raw.get(key, {}) for raw in raws]
+        common = set.intersection(*(set(s) for s in series)) if series else set()
+        out[key] = {ym: sum(s[ym] for s in series) / len(series) for ym in common}
+    return out
+
+
 def write_corrected(
     db: Session, site: ClimateSite, model: str, scenario: str, raw: dict[str, Series],
-    observed: dict[str, Series], reference: range,
+    observed: dict[str, Series], reference: range, model_reference: dict[str, Series] | None = None,
 ) -> int:
     """
     Corrige les projections brutes d'un modèle et d'un scénario, mois par
     mois, avec le climat réel de la période `reference`, puis les écrit
     sur la période affichée.
+
+    La correction compare le réel au modèle sur la référence. Le modèle y
+    est représenté par `model_reference` (la moyenne de ses scénarios) :
+    tous les scénarios reçoivent ainsi la MÊME correction, et l'écart entre
+    eux est conservé exactement. Sans `model_reference`, le scénario lui-même.
     """
     corrected: dict[str, Series] = {}
+    basis = model_reference if model_reference is not None else raw
     for var in cfg.CLIMATE_VARIABLES:
         factors = correction_factors(
             climatology(observed.get(var.key, {}), reference),
-            climatology(raw.get(var.key, {}), reference),
+            climatology(basis.get(var.key, {}), reference),
             var.correction,
         )
         corrected[var.key] = {
@@ -535,11 +598,15 @@ def store_real_surfaces(db: Session, site: ClimateSite, client, workdir: Path, t
     return written
 
 
-def observed_for_reference(db: Session, site: ClimateSite, client, reference: range, workdir: Path) -> dict[str, Series]:
+def observed_for_reference(
+    db: Session, site: ClimateSite, client, reference: range, workdir: Path,
+    surfaces: dict[str, Series] | None = None,
+) -> dict[str, Series]:
     """
     Le climat réel d'une période de référence, pour la correction :
     weather_daily pour les années déjà présentes, l'archive Open-Meteo pour
-    les autres (sans les enregistrer), et ERA5 pour les surfaces.
+    les autres (sans les enregistrer), et ERA5 pour les surfaces (celles
+    déjà reçues si elles sont données, sinon une demande).
     """
     stored = real_monthly_from_weather(db, site)
     stored_years = {y for series in stored.values() for (y, _m) in series}
@@ -552,9 +619,12 @@ def observed_for_reference(db: Session, site: ClimateSite, client, reference: ra
             "🌍 [climat] %s · météo réelle de référence %d-%d lue chez Open-Meteo (non enregistrée)",
             site.name, min(missing), max(missing),
         )
-    surfaces = download_era5_surfaces(
-        client, site.latitude, site.longitude, list(reference), workdir, site, purpose="référence"
-    )
+    if surfaces is None:
+        surfaces = download_era5_surfaces(
+            client, site.latitude, site.longitude, list(reference), workdir, site, purpose="référence"
+        )
+    else:
+        surfaces = {k: {ym: v for ym, v in s.items() if ym[0] in reference} for k, s in surfaces.items()}
     return _merge(archive, stored, surfaces)
 
 
@@ -609,11 +679,20 @@ def prepare_site(db: Session, site_id: int, client=None, today: date | None = No
     reference = range(cfg.BASELINE_START, cfg.BASELINE_END + 1)
     summary = {"site_id": site.id, "weather_days": 0, "real_surface_months": 0, "projections": 0}
 
+    # Températures de surface : UNE demande ERA5, terre et mer ensemble, de la
+    # référence à la dernière année complète ; les mois de l'année en cours
+    # sont ajoutés ensuite par la tâche mensuelle
+    end_y, end_m = last_complete_month(today)
+    last_full_year = end_y if end_m == 12 else end_y - 1
+    surface_years = list(range(cfg.BASELINE_START, last_full_year + 1))
+
+    # La simulation « historical » n'est demandée que si la référence commence
+    # avant 2015 (fin de « historical ») ; avec 2015-2025, elle est inutile
+    needs_historical = cfg.BASELINE_START <= cfg.CMIP6_HISTORICAL_END
+
     # Nombre de demandes à Copernicus, pour afficher l'avancement
-    n_surfaces = len(cfg.ERA5_STORED_VARIABLES)
-    plan = _real_surface_plan(site, today)
-    n_real = n_surfaces * len(_era5_batches(list(range(plan[0].year, plan[1] + 1)), plan[1:])) if plan else 0
-    total = n_real + n_surfaces + len(cfg.MODELS) * len(cfg.CLIMATE_VARIABLES) * (1 + len(cfg.SCENARIOS))
+    periods = len(cfg.SCENARIOS) + (1 if needs_historical else 0)
+    total = (1 if surface_years else 0) + len(cfg.MODELS) * len(cfg.CMIP6_DOWNLOADED_VARIABLES) * periods
     global _progress
     _progress = _Progress(site.name, total)
     logger.info(
@@ -630,24 +709,32 @@ def prepare_site(db: Session, site_id: int, client=None, today: date | None = No
             logger.info(
                 "🌍 [climat] %s · météo réelle Open-Meteo : %d jours ajoutés", site.name, summary["weather_days"]
             )
-            summary["real_surface_months"] = store_real_surfaces(db, site, client, workdir, today)
-            observed = observed_for_reference(db, site, client, reference, workdir)
+            surfaces = download_era5_surfaces_once(client, site, surface_years, workdir)
+            summary["real_surface_months"] = store_surfaces(db, site, surfaces, cfg.START_YEAR, last_full_year)
+            observed = observed_for_reference(db, site, client, reference, workdir, surfaces=surfaces)
 
             for model in cfg.MODELS:
                 past = list(range(cfg.BASELINE_START, min(cfg.BASELINE_END, cfg.CMIP6_HISTORICAL_END) + 1))
                 historical = download_cmip6(client, site.latitude, site.longitude, model, HISTORICAL, past, workdir)
+                raws: dict[str, dict[str, Series]] = {}
                 for scenario in cfg.SCENARIOS:
                     future = list(range(max(cfg.CMIP6_HISTORICAL_END + 1, cfg.BASELINE_START), cfg.END_YEAR + 1))
-                    raw = _merge(
+                    raws[scenario] = _merge(
                         historical,
                         download_cmip6(client, site.latitude, site.longitude, model, scenario, future, workdir),
                     )
                     # Brutes : depuis le début de la référence, pour recalculer plus tard
                     upsert_months(
                         db, site.id, SOURCE_CMIP6, scenario, model, False,
-                        _rows_from_series(raw, range(cfg.BASELINE_START, cfg.END_YEAR + 1), site.latitude),
+                        _rows_from_series(raws[scenario], range(cfg.BASELINE_START, cfg.END_YEAR + 1), site.latitude),
                     )
-                    summary["projections"] += write_corrected(db, site, model, scenario, raw, observed, reference)
+                    db.commit()
+                # Une même correction pour tous les scénarios du modèle
+                common = scenario_mean(list(raws.values()))
+                for scenario, raw in raws.items():
+                    summary["projections"] += write_corrected(
+                        db, site, model, scenario, raw, observed, reference, model_reference=common,
+                    )
                     db.commit()
                     logger.info("🌍 [climat] %s · %s %s : projection enregistrée", site.name, model, scenario)
     except Exception as exc:
@@ -711,9 +798,12 @@ def recompute_corrections(db: Session, site_id: int, client=None, today: date | 
     with tempfile.TemporaryDirectory() as tmp:
         observed = observed_for_reference(db, site, client or src.make_client(), reference, Path(tmp))
         for model in cfg.MODELS:
-            for scenario in cfg.SCENARIOS:
-                raw = load_raw_series(db, site.id, model, scenario)
-                if raw:
-                    written += write_corrected(db, site, model, scenario, raw, observed, reference)
+            raws = {sc: raw for sc in cfg.SCENARIOS if (raw := load_raw_series(db, site.id, model, sc))}
+            if not raws:
+                continue
+            # Une même correction pour tous les scénarios du modèle
+            common = scenario_mean(list(raws.values()))
+            for scenario, raw in raws.items():
+                written += write_corrected(db, site, model, scenario, raw, observed, reference, model_reference=common)
     db.commit()
     return written

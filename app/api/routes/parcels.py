@@ -161,7 +161,15 @@ def _launch_history_task(parcel_id: int) -> None:
     except Exception:
         logger.exception("Échec du lancement de l'historique (parcel_id=%s)", parcel_id)
 
+def _launch_weather_history(farm_id: int) -> None:
+    """Historique météo de la ferme en arrière-plan ; une panne ne bloque rien."""
+    try:
+        from app.tasks.weather_tasks import launch_farm_history
 
+        launch_farm_history(farm_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Échec du lancement de l'historique météo (farm_id=%s)", farm_id)
+        
 # ----------------------------------------------------------------------
 # GET /parcels — liste
 # ----------------------------------------------------------------------
@@ -252,6 +260,11 @@ def create_parcel(
     if is_active:
         _launch_ingestion_tasks(row.id)
         _launch_history_task(row.id)
+        
+    # Historique météo de la ferme depuis 2020, si elle ne l'a pas encore
+    # (première parcelle d'une ferme sans position) : la tâche ne récupère
+    # que les jours manquants, elle ne refait rien si tout est déjà là
+    _launch_weather_history(row.farm_id)
 
     return ParcelResponse(
         id=row.id,
