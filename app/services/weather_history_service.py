@@ -119,16 +119,20 @@ def _is_temporary(exc: Exception) -> bool:
     return False
 
 
-def _fetch_range(url: str, params: dict) -> dict:
-    """Une demande à Open-Meteo, avec de nouvelles tentatives si l'erreur est passagère."""
-    for attempt in range(FETCH_ATTEMPTS):
+def _fetch_range(url: str, params: dict, attempts: int = FETCH_ATTEMPTS) -> dict:
+    """
+    Une demande à Open-Meteo, avec de nouvelles tentatives si l'erreur est
+    passagère. `attempts=1` : une seule tentative, sans attente (pour une
+    page ouverte par un utilisateur, qui ne doit pas attendre).
+    """
+    for attempt in range(attempts):
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
                 response = client.get(url, params=params)
                 response.raise_for_status()
             return response.json().get("daily") or {}
         except Exception as exc:  # noqa: BLE001 — on trie ci-dessous
-            if attempt == FETCH_ATTEMPTS - 1 or not _is_temporary(exc):
+            if attempt == attempts - 1 or not _is_temporary(exc):
                 raise
             rate_limited = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
             pause = RATE_LIMIT_PAUSE_S if rate_limited else RETRY_PAUSES_S[min(attempt, len(RETRY_PAUSES_S) - 1)]
@@ -141,7 +145,8 @@ def _fetch_range(url: str, params: dict) -> dict:
 
 
 def fetch_daily(
-    latitude: float, longitude: float, start: date, end: date, *, archive: bool
+    latitude: float, longitude: float, start: date, end: date, *, archive: bool,
+    attempts: int = FETCH_ATTEMPTS,
 ) -> list[dict]:
     """
     Récupère la météo jour par jour entre `start` et `end` inclus.
@@ -165,7 +170,7 @@ def fetch_daily(
             "end_date": chunk_end.isoformat(),
             "daily": ",".join(DAILY_VARIABLES),
             "timezone": "auto",
-        })
+        }, attempts)
         rows.extend(_rows_from_daily(daily))
         chunk_start = chunk_end + timedelta(days=1)
     return rows
@@ -276,7 +281,7 @@ def upsert_days(
 # ======================================================================
 
 
-def sync_farm(db: Session, farm: dict, start: date, end: date) -> int:
+def sync_farm(db: Session, farm: dict, start: date, end: date, attempts: int = FETCH_ATTEMPTS) -> int:
     """
     Synchronise une ferme entre `start` et `end` inclus : l'archive pour
     les jours anciens, l'API de prévision pour les jours récents.
@@ -287,14 +292,14 @@ def sync_farm(db: Session, farm: dict, start: date, end: date) -> int:
 
     if start <= archive_end:
         rows = fetch_daily(
-            farm["latitude"], farm["longitude"], start, archive_end, archive=True
+            farm["latitude"], farm["longitude"], start, archive_end, archive=True, attempts=attempts
         )
         written += upsert_days(db, farm, rows, "archive")
 
     forecast_start = max(start, archive_end + timedelta(days=1))
     if forecast_start <= end:
         rows = fetch_daily(
-            farm["latitude"], farm["longitude"], forecast_start, end, archive=False
+            farm["latitude"], farm["longitude"], forecast_start, end, archive=False, attempts=attempts
         )
         written += upsert_days(db, farm, rows, "forecast")
 

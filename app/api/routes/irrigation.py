@@ -332,7 +332,7 @@ async def water_balance(
 ):
     """
     Pour chaque culture en cours de la parcelle : le bilan d'eau des
-    7 derniers jours (besoin, pluie utile, irrigation, besoin couvert) et
+    7 derniers jours (besoin, pluie mesurée, arrosages, besoin couvert) et
     celui des dernières semaines. Méthode : app/services/water_balance_service.py.
     """
     parcel = _own_parcel(db, parcel_id, user)

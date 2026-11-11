@@ -10,7 +10,6 @@ from datetime import date, timedelta
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
@@ -32,12 +31,13 @@ from app.schemas.diagnosis import (
     StageTimelineItem,
     WaterNeedResponse,
 )
-from app.services.agronomy.calendar import get_periods, get_stage_at, get_stages_at
+from app.services.agronomy.calendar import get_periods, get_stage_at
 from app.services.agronomy.species import SPECIES, is_annual, stage_label
 from app.services.agronomy.water import evaluate_soil
 from app.services.alert_service import SEVERITY_LABELS, sync_alert
 from app.services.crop_monitoring import archive_diagnosis, run_diagnosis
-from app.services.water_service import get_water_need
+from app.services import water_balance_service
+from app.services.irrigation_service import active_crops
 
 router = APIRouter(tags=["diagnosis"])
 
@@ -250,54 +250,29 @@ def list_parcel_interpretations(
 # ----------------------------------------------------------------------
 
 
-@router.get("/crops/{crop_id}/needs", response_model=NeedsResponse)
-async def get_crop_needs(
-    crop_id: int,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Besoins de la culture : irrigation calculée depuis la météo et le
-    coefficient cultural, fertilisation déduite de la dernière analyse
-    de sol comparée aux références de l'espèce.
-    """
-    crop = _get_owned_crop(crop_id, user, db)
-
-    # Culture clôturée : aucune irrigation ni fertilisation à conseiller
-    closed = _closed_reason(crop)
-    if closed:
-        return NeedsResponse(
-            crop_id=crop_id,
-            closed_reason=closed.replace("plus de suivi satellite", "aucun besoin en eau ni en fertilisation"),
-        )
-
-    row = db.execute(
-        text("""
-            SELECT f.id AS farm_id, f.latitude, f.longitude,
-                   ST_Area(p.geom::geography) / 10000.0 AS area_ha
-            FROM parcel p JOIN farm f ON f.id = p.farm_id
-            WHERE p.id = :pid
-        """),
-        {"pid": crop.parcel_id},
-    ).fetchone()
-
-    # Tous les stades actifs aujourd'hui : le Kc retenu est le plus élevé
-    # (voir water.get_kc_for_stages), et non celui du seul stade principal
-    state = get_stages_at(crop.species, date.today(), crop.planting_date)
-    stages = state.codes if state else ()
-
     # --- Irrigation ---------------------------------------------------
+    # Le même calcul que le Suivi de l'irrigation (water_balance_service) :
+    # les 7 derniers jours de météo enregistrée, besoin jour par jour
+    # (ET₀ × Kc du stade de chaque jour), pluie mesurée et arrosages de la
+    # parcelle. Les chiffres sont identiques à ceux de la page Irrigation.
     water = None
-    if row and row.latitude is not None and row.longitude is not None:
-        need = await get_water_need(
-            species=crop.species, stage=stages,
-            latitude=row.latitude, longitude=row.longitude,
-            area_ha=row.area_ha,
-            # La météo des derniers jours est lue en base, sans appel extérieur
-            db=db, farm_id=row.farm_id,
+    parcel = db.get(Parcel, crop.parcel_id)
+    if parcel:
+        last_day = water_balance_service.last_weather_day(db, parcel.farm_id)
+        reference_day = min(last_day, date.today()) if last_day else date.today() - timedelta(days=1)
+        single = len(active_crops(db, parcel.id)) == 1
+        b = water_balance_service.period_balance(
+            db, parcel, crop, reference_day - timedelta(days=6), reference_day, single, last_day,
         )
-        if need:
-            water = WaterNeedResponse(**need.__dict__)
+        water = WaterNeedResponse(
+            start=b["start"], end=b["end"], days=b["days"],
+            et0_mm=b["et0_mm"], kc=b["kc"], kc_varies=b["kc_varies"],
+            need_mm=b["need_mm"], rain_mm=b["rain_mm"],
+            irrigation_l=b["irrigation_l"], irrigation_mm=b["irrigation_mm"],
+            received_mm=b["received_mm"], coverage_pct=b["coverage_pct"],
+            missing_mm=round(max(b["need_mm"] - b["received_mm"], 0), 1) if b["need_mm"] is not None else None,
+            missing_l=b["missing_l"], status=b["status"], problems=b["problems"],
+        )
 
     # --- Fertilisation ------------------------------------------------
     analysis = (
@@ -327,3 +302,4 @@ async def get_crop_needs(
         soil=soil_rows,
         soil_analysis_date=analysis_date,
     )
+    

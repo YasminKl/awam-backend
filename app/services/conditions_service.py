@@ -19,13 +19,17 @@ cumuls (pluie, ET₀, jours secs).
 from __future__ import annotations
 
 import calendar
-from datetime import date
+from datetime import date, timedelta
 from statistics import mean
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+import logging
+import time
+
 from app.core import conditions_config as cfg
+from app.services import weather_history_service as weather
 
 #: Les paramètres du mois, et comment comparer chacun à sa normale :
 #: « diff » = différence (même unité), « pct » = pourcentage
@@ -45,6 +49,66 @@ PARAMETERS: dict[str, str] = {
 CUMULATIVE = {"precipitation_mm", "et0_mm", "dry_days"}
 
 
+logger = logging.getLogger(__name__)
+
+#: Au-delà de ce nombre de jours manquants, l'historique est laissé à la
+#: tâche d'arrière-plan (plusieurs demandes) au lieu d'être fait à la demande
+MAX_ON_DEMAND_DAYS = 400
+
+#: Après un échec, Open-Meteo n'est pas redemandé pour cette ferme avant ce délai
+RETRY_AFTER_S = 600
+
+_last_attempt: dict[int, float] = {}
+
+
+# ======================================================================
+# Météo à jour, à la demande
+# ======================================================================
+
+
+def last_recorded_day(db: Session, farm_id: int) -> date | None:
+    """Le dernier jour de météo enregistré pour la ferme."""
+    return db.execute(text("SELECT MAX(day) FROM weather_daily WHERE farm_id = :f"), {"f": farm_id}).scalar()
+
+
+def ensure_weather_up_to_date(db: Session, farm_id: int, today: date | None = None) -> date | None:
+    """
+    À l'ouverture de la page : complète TOUT DE SUITE la météo de la ferme
+    jusqu'à hier, si des jours manquent, sans attendre la tâche du matin.
+    Une seule tentative, sans attente : si Open-Meteo ne répond pas, la page
+    s'affiche avec les jours déjà enregistrés, et Open-Meteo n'est pas
+    redemandé avant RETRY_AFTER_S. Retourne le dernier jour enregistré.
+    """
+    yesterday = (today or date.today()) - timedelta(days=1)
+    last = last_recorded_day(db, farm_id)
+    if last is not None and last >= yesterday:
+        return last
+    if time.monotonic() - _last_attempt.get(farm_id, -RETRY_AFTER_S) < RETRY_AFTER_S:
+        return last
+    _last_attempt[farm_id] = time.monotonic()
+
+    if last is None or (yesterday - last).days > MAX_ON_DEMAND_DAYS:
+        # Historique complet (depuis 2020) : plusieurs demandes, en arrière-plan
+        try:
+            from app.tasks.weather_tasks import launch_farm_history
+
+            launch_farm_history(farm_id, countdown=0)
+        except Exception:  # noqa: BLE001
+            logger.exception("🌦️ [météo] Ferme %s : historique non programmé", farm_id)
+        return last
+
+    farms = weather.farm_coordinates(db, farm_id)
+    if not farms:
+        return last
+    try:
+        written = weather.sync_farm(db, farms[0], last + timedelta(days=1), yesterday, attempts=1)
+        logger.info("🌦️ [météo] Ferme %s : %d jour(s) ajoutés à l'ouverture de la page", farm_id, written)
+        _last_attempt.pop(farm_id, None)
+    except Exception as exc:  # noqa: BLE001 — la page s'affiche quand même
+        db.rollback()
+        logger.warning("🌦️ [météo] Ferme %s : météo non complétée à l'ouverture de la page : %s", farm_id, exc)
+    return last_recorded_day(db, farm_id)
+    
 # ======================================================================
 # Lecture
 # ======================================================================

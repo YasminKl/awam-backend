@@ -330,7 +330,6 @@ def check_species_and_water() -> None:
     from app.services.agronomy.water import (
         STAGE_TO_PHASE, get_kc, get_kc_for_stages,
     )
-    from app.services.water_service import compute_water_need
 
     # La liste des stades de chaque espece = l'ordre de son calendrier
     ecarts = []
@@ -359,9 +358,6 @@ def check_species_and_water() -> None:
     # Plusieurs stades actifs : le Kc le plus eleve
     juin = get_stages_at("thym", date(2027, 6, 15)).codes
     check("Kc thym en juin : pleine saison, pas fin de saison", get_kc_for_stages("thym", juin), 0.65)
-    besoin = compute_water_need("thym", juin, et0_mm=40.0, rain_mm=0.0, area_ha=1.0)
-    check("besoin en eau du thym en juin : ETc = 40 x 0,65", besoin.etc_mm, 26.0)
-
 
 def check_lifespan() -> None:
     """Duree de vie et production optimale : messages selon l'age."""

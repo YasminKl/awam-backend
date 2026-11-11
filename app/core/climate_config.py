@@ -113,19 +113,6 @@ PERIOD_YEARS = _int("CLIMATE_PERIOD_YEARS", 5)
 #: large pour contenir de la mer et quelques mailles des modèles
 AREA_MARGIN = _float("CLIMATE_AREA_MARGIN", 2.0)
 
-
-#: Les zones demandées sont centrées sur une grille de ce pas (degrés) :
-#: deux lieux proches (même case de la grille) demandent exactement la même
-#: zone, et le fichier reçu une fois sert aux deux (voir CACHE_DIR)
-AREA_GRID = _float("CLIMATE_AREA_GRID", 0.5)
-
-#: Dossier où les fichiers reçus de Copernicus sont gardés, pour être
-#: réutilisés par les lieux proches sans nouvelle demande
-CACHE_DIR = os.getenv("CLIMATE_CACHE_DIR", "data/climate_cache")
-
-if AREA_GRID <= 0 or AREA_GRID > AREA_MARGIN:
-    raise ValueError("CLIMATE_AREA_GRID doit être positif et ne pas dépasser CLIMATE_AREA_MARGIN")
-
 # ----------------------------------------------------------------------
 # Jeux de données Copernicus
 # ----------------------------------------------------------------------
@@ -169,6 +156,7 @@ class ClimateVariable:
     #: Projection CMIP6 non demandée : calculée à partir des températures
     #: maximale et minimale, (max + min) / 2, une demande de moins par période
     cmip6_from_minmax: bool = False
+
 
 #: Les variables de la projection climatique
 CLIMATE_VARIABLES: list[ClimateVariable] = [
@@ -214,6 +202,7 @@ ERA5_STORED_VARIABLES = [v for v in CLIMATE_VARIABLES if not v.from_weather_dail
 
 #: Variables demandées à CMIP6 (la température moyenne est calculée)
 CMIP6_DOWNLOADED_VARIABLES = [v for v in CLIMATE_VARIABLES if not v.cmip6_from_minmax]
+
 
 def middle_year() -> int:
     """Une année au milieu de la période : utile pour tester les projections."""

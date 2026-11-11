@@ -14,14 +14,11 @@ cours d'une parcelle et pour un mois.
    (au-dessus de toutes, en dessous de toutes, ou dans la fourchette).
 
 2. L'EAU
-   Calcul propre à cet onglet, uniquement avec des données de la
-   plateforme, sans coefficient estimé :
-     besoin (mm)        = ET₀ réelle (Open-Meteo) × Kc du stade (référentiel AWAM)
-     eau reçue (mm)     = pluie mesurée (comptée en entier) + arrosages enregistrés
-     besoin couvert (%) = eau reçue ÷ besoin × 100
-   La seule limite utilisée est 100 % : le besoin lui-même. Pour le mois,
-   ses semaines, et la saison depuis le début de la campagne agricole
-   (cumulée mois par mois : le Kc change avec le stade).
+   Le même calcul que le Suivi de l'irrigation et la page Cultures
+   (water_balance_service.period_balance) : besoin ET₀ × Kc jour par jour,
+   pluie mesurée comptée en entier, arrosages de toute la parcelle répartis
+   sur sa surface, besoin couvert si l'eau reçue atteint le besoin. Pour le
+   mois, ses semaines, et la saison depuis le début de la campagne agricole.
 
 3. LES AUTRES STRESS (chaleur, gel, excès d'humidité) : à activer quand
    leurs seuils par culture et par stade seront validés.
@@ -40,10 +37,9 @@ from app.models.crop import Crop
 from app.models.parcel import Parcel
 from app.services import conditions_service as cs
 from app.services import water_balance_service as wb
-from app.services.agronomy.calendar import StagePeriod, get_periods, get_stages_at
-from app.services.agronomy.water import get_kc_for_stages
+from app.services.agronomy.calendar import StagePeriod, get_periods
 from app.services.agronomy.species import SPECIES, stage_label
-from app.services.irrigation_service import active_crops, crop_area_m2, crop_labels
+from app.services.irrigation_service import active_crops, crop_labels
 
 #: Paramètres comparés pendant un stade, et comment exprimer leur écart
 STAGE_PARAMETERS: dict[str, str] = {
@@ -135,10 +131,14 @@ def stage_summary(parameters: dict, first: int, last: int) -> str:
     return f"Hors de la fourchette des années {first} à {last} : {listed} que toutes ces années."
 
 
-def stage_climate(db: Session, farm_id: int, start: date, end: date, today: date) -> dict:
-    """Le climat réel d'une période de stade, et sa normale sur les mêmes dates."""
+def stage_climate(db: Session, farm_id: int, start: date, end: date, today: date, until: date | None = None) -> dict:
+    """
+    Le climat réel d'une période de stade, et sa normale sur les mêmes dates.
+    `until` : dernier jour de météo enregistré ; la période et la normale
+    s'arrêtent au même jour.
+    """
     yesterday = today - timedelta(days=1)
-    last = min(end, yesterday)
+    last = min(end, yesterday, until or yesterday)
     current = cs.month_values(cs.daily_rows(db, farm_id, start, last)) if start <= last else {}
     span = (last - start).days + 1 if start <= last else 0
 
@@ -186,53 +186,24 @@ def crop_stages(crop: Crop, year: int, month: int) -> list[dict]:
 
 def water_period(db: Session, parcel: Parcel, crop: Crop, start: date, end: date, single: bool) -> dict:
     """
-    Le bilan d'eau d'une culture sur une période, uniquement avec des
-    données de la plateforme : ET₀ et pluie réelles, Kc du référentiel,
-    arrosages enregistrés. Quand une donnée manque, aucun chiffre n'est
+    Le bilan d'eau d'une culture sur une période : le calcul du Suivi de
+    l'irrigation (water_balance_service.period_balance), présenté avec les
+    champs de cet onglet. Quand une donnée manque, aucun chiffre n'est
     donné, et la raison est dite.
     """
-    days = (end - start).days + 1
-    known_days, et0, rain = wb._weather(db, parcel.farm_id, start, end)
-    middle = start + timedelta(days=days // 2)
-    stages = get_stages_at(crop.species, middle, crop.planting_date)
-    kc = get_kc_for_stages(crop.species, stages.codes) if stages else None
-    irrigation_l = wb._irrigation_liters(db, parcel, crop, single, start, end)
-
-    problems = []
-    if known_days < days:
-        problems.append(f"la météo réelle manque pour {days - known_days} jour(s) de la période")
-    if kc is None:
-        problems.append("le référentiel AWAM n'a pas de Kc pour cette espèce à ce stade")
-    area = None
-    if irrigation_l > 0:
-        # Litres → mm : il faut la surface qui a reçu l'eau
-        area = crop_area_m2(db, parcel, crop)
-        if area is None:
-            problems.append("des arrosages sont enregistrés, mais la surface de chaque culture de la parcelle est inconnue")
-
-    out = {
-        "start": start, "end": end, "days": days,
-        "et0_mm": round(et0, 1), "kc": kc, "rain_mm": round(rain, 1),
-        "irrigation_l": round(irrigation_l, 0),
-        "need_mm": None, "irrigation_mm": None, "received_mm": None,
-        "coverage_pct": None, "missing_mm": None, "covered": None, "problems": problems,
+    b = wb.period_balance(db, parcel, crop, start, end, single)
+    missing_mm = None
+    if b["need_mm"] is not None and b["received_mm"] is not None:
+        missing_mm = round(max(b["need_mm"] - b["received_mm"], 0), 1)
+    return {
+        "start": b["start"], "end": b["end"], "days": b["days"],
+        "et0_mm": b["et0_mm"], "kc": b["kc"], "rain_mm": b["rain_mm"],
+        "irrigation_l": b["irrigation_l"],
+        "need_mm": b["need_mm"], "irrigation_mm": b["irrigation_mm"], "received_mm": b["received_mm"],
+        "coverage_pct": b["coverage_pct"], "missing_mm": missing_mm,
+        "covered": None if b["status"] is None else b["status"] == wb.STATUS_COVERED,
+        "problems": b["problems"],
     }
-    if problems:
-        return out
-    need_mm = et0 * kc
-    irrigation_mm = irrigation_l / area if area else 0.0
-    received_mm = rain + irrigation_mm
-    coverage = received_mm / need_mm * 100 if need_mm > 0 else None
-    out.update({
-        "need_mm": round(need_mm, 1),
-        "irrigation_mm": round(irrigation_mm, 1),
-        "received_mm": round(received_mm, 1),
-        "coverage_pct": round(coverage, 0) if coverage is not None else None,
-        "missing_mm": round(max(need_mm - received_mm, 0), 1),
-        # La seule limite : le besoin lui-même
-        "covered": received_mm >= need_mm,
-    })
-    return out
 
 
 def _weeks_not_covered(db: Session, parcel: Parcel, crop: Crop, start: date, end: date, single: bool) -> list[dict]:
@@ -279,11 +250,16 @@ def _season(db: Session, parcel: Parcel, crop: Crop, start: date, end: date, sin
     }
 
 
-def crop_water(db: Session, parcel: Parcel, crop: Crop, year: int, month: int, single: bool, today: date) -> dict:
-    """L'eau du mois (jusqu'à hier), ses semaines non couvertes, et la saison."""
+def crop_water(
+    db: Session, parcel: Parcel, crop: Crop, year: int, month: int, single: bool, today: date, until: date | None = None,
+) -> dict:
+    """
+    L'eau du mois, ses semaines non couvertes, et la saison, jusqu'au
+    dernier jour de météo enregistré (`until`, au plus tard hier).
+    """
     yesterday = today - timedelta(days=1)
     start = date(year, month, 1)
-    end = min(_month_end(year, month), yesterday)
+    end = min(_month_end(year, month), yesterday, until or yesterday)
     if start > end:
         return {"month": None, "weeks": [], "season": None}
     season_year = year if month >= cfg.SEASON_START_MONTH else year - 1
@@ -304,6 +280,8 @@ def crop_water(db: Session, parcel: Parcel, crop: Crop, year: int, month: int, s
 def parcel_impacts(db: Session, parcel: Parcel, year: int, month: int, today: date | None = None) -> dict:
     """Tout ce qu'affiche l'onglet Impacts, pour chaque culture en cours de la parcelle."""
     today = today or date.today()
+    # Dernier jour de météo enregistré : les calculs s'y arrêtent, sans rien estimer
+    until = cs.last_recorded_day(db, parcel.farm_id)
     crops = active_crops(db, parcel.id)
     single = len(crops) == 1
     out = []
@@ -311,14 +289,14 @@ def parcel_impacts(db: Session, parcel: Parcel, year: int, month: int, today: da
         spec = SPECIES.get(crop.species)
         stages = []
         for s in crop_stages(crop, year, month):
-            stages.append({**s, **stage_climate(db, parcel.farm_id, s["start"], s["end"], today)})
+            stages.append({**s, **stage_climate(db, parcel.farm_id, s["start"], s["end"], today, until)})
         out.append({
             "crop_id": crop.id,
             "label": crop_labels(db, [crop.id])[0]["label"],
             "species_label": spec.label if spec else crop.species,
             "planting_date": crop.planting_date,
             "stages": stages,
-            "water": crop_water(db, parcel, crop, year, month, single, today),
+            "water": crop_water(db, parcel, crop, year, month, single, today, until),
         })
     return {
         "parcel_id": parcel.id,
@@ -326,5 +304,7 @@ def parcel_impacts(db: Session, parcel: Parcel, year: int, month: int, today: da
         "month": f"{year}-{month:02d}",
         "normals_period": [cfg.NORMALS_START, cfg.NORMALS_END],
         "season_start_month": cfg.SEASON_START_MONTH,
+        #: Dernier jour de météo enregistré pour la ferme
+        "weather_until": until,
         "crops": out,
     }

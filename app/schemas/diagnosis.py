@@ -1,4 +1,5 @@
 from datetime import date
+from datetime import date
 from typing import Literal, Optional
 
 from pydantic import BaseModel
@@ -63,15 +64,37 @@ class DiagnosisResponse(BaseModel):
 
 
 class WaterNeedResponse(BaseModel):
+    """
+    Besoin en eau des 7 derniers jours de météo enregistrée : le même calcul
+    que le Suivi de l'irrigation (app/services/water_balance_service.py).
+    """
+
+    start: date
+    end: date
     days: int
+    #: ET₀ réelle cumulée (Open-Meteo), mm
     et0_mm: float
+    #: Kc moyen de la période (besoin ÷ ET₀), référentiel AWAM
     kc: Optional[float] = None
-    etc_mm: float
+    #: Le stade, donc le Kc, change pendant la période
+    kc_varies: bool = False
+    #: Besoin de la culture, jour par jour : ET₀ × Kc, mm
+    need_mm: Optional[float] = None
+    #: Pluie mesurée, comptée en entier, mm
     rain_mm: float
-    effective_rain_mm: float
-    net_need_mm: float
-    net_need_m3: Optional[float] = None
-    message: str
+    #: Arrosages faits sur la parcelle
+    irrigation_l: float
+    irrigation_mm: Optional[float] = None
+    #: Pluie + arrosages, mm
+    received_mm: Optional[float] = None
+    coverage_pct: Optional[float] = None
+    #: Eau qui manque pour couvrir le besoin, mm et litres (pour toute la parcelle)
+    missing_mm: Optional[float] = None
+    missing_l: Optional[float] = None
+    #: « couvert » ou « non_couvert » ; None si non calculable
+    status: Optional[str] = None
+    #: Pourquoi le besoin n'est pas calculable, le cas échéant
+    problems: list[str] = []
 
 
 class SoilRowResponse(BaseModel):
