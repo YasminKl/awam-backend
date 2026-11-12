@@ -133,6 +133,15 @@ def sync_recent_weather(days: int = RECENT_WINDOW_DAYS) -> dict:
                     "⚠️ [météo] Prévisions indisponibles pour la ferme %s (%s) : %s",
                     farm["id"], farm["name"], exc,
                 )
+        # Alertes « Besoin en eau », avec la météo qui vient d'être mise à
+        # jour : une erreur ici ne remet pas en cause la météo enregistrée
+        try:
+            from app.services.water_alert_service import sync_all
+
+            summary["water_alerts"] = sync_all(db)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("⚠️ [alertes] Alertes d'eau non mises à jour")
         logger.info(
             "🏁 [météo] Terminé jusqu'au %s : %d fermes OK, %d en échec, "
             "%d rattrapées, %d jours écrits",

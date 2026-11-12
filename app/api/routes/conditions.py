@@ -11,7 +11,7 @@ Lecture seule : tout est calculé à partir de la météo réelle de la ferme
 import re
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Response
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
@@ -21,7 +21,7 @@ from app.models.parcel import Parcel
 from app.models.utilisateur import User
 from app.schemas.conditions import MonthConditions, YearComparison
 from app.services import conditions_service as conditions
-from app.services import impact_service, vegetation_service
+from app.services import impact_service, report_pdf, report_service, vegetation_service
 
 router = APIRouter(tags=["climat et cultures"])
 
@@ -148,3 +148,56 @@ def parcel_vegetation(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Ce mois n'est pas encore commencé.")
     conditions.ensure_weather_up_to_date(db, parcel.farm_id, today)
     return vegetation_service.parcel_vegetation(db, parcel, year, number, today)
+
+    
+
+def _report(parcel_id: int, month: str | None, user: User, db: Session) -> dict:
+    """Le rapport mensuel d'une parcelle de l'utilisateur (les deux routes du rapport)."""
+    parcel = (
+        db.query(Parcel).join(Farm, Farm.id == Parcel.farm_id)
+        .filter(Parcel.id == parcel_id, Farm.user_id == user.id).first()
+    )
+    if not parcel:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Parcelle introuvable.")
+    today = date.today()
+    if month is None:
+        year, number = today.year, today.month
+    else:
+        match = MONTH_PATTERN.match(month)
+        if not match:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Mois attendu au format AAAA-MM, par exemple 2026-10.")
+        year, number = int(match.group(1)), int(match.group(2))
+        if (year, number) > (today.year, today.month):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Ce mois n'est pas encore commencé.")
+    conditions.ensure_weather_up_to_date(db, parcel.farm_id, today)
+    return report_service.parcel_month_report(db, parcel, year, number, today)
+
+
+@router.get("/parcels/{parcel_id}/report")
+def parcel_report(
+    parcel_id: int,
+    month: str | None = Query(None, description="Mois au format AAAA-MM ; par défaut, le mois en cours"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Le rapport mensuel d'une parcelle : climat, stades, eau, végétation, alertes, arrosages."""
+    return _report(parcel_id, month, user, db)
+
+
+@router.get("/parcels/{parcel_id}/report.pdf")
+def parcel_report_pdf(
+    parcel_id: int,
+    month: str | None = Query(None, description="Mois au format AAAA-MM ; par défaut, le mois en cours"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Le même rapport, en PDF à télécharger."""
+    report = _report(parcel_id, month, user, db)
+    pdf = report_pdf.build_pdf(report)
+    safe = "".join(ch if ch.isalnum() else "-" for ch in report["parcel_name"]).strip("-") or "parcelle"
+    filename = f"rapport-{safe}-{report['month']}.pdf"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

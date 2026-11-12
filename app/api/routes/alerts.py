@@ -23,7 +23,7 @@ from app.models.crop_diagnosis import CropDiagnosis
 from app.models.farm import Farm
 from app.models.parcel import Parcel
 from app.models.utilisateur import User
-from app.schemas.alert import AlertCount, AlertHistoryItem, AlertResolve, AlertResponse
+from app.schemas.alert import AlertCount, AlertHistoryItem, AlertResolve, AlertResponse, AlertsOverview
 from app.services.agronomy.species import SPECIES
 from app.services.alert_service import RESOLUTION_LABELS, SEVERITY_LABELS
 
@@ -174,6 +174,39 @@ async def list_alerts(
     return [_to_response(a, db) for a in alerts]
 
 
+#: Les alertes clôturées affichées sur la page Alertes : les 30 derniers jours
+CLOSED_DAYS = 30
+
+
+@router.get("/alerts/overview", response_model=AlertsOverview)
+async def alerts_overview(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    La page Alertes, sur toutes les fermes de l'utilisateur : les alertes
+    actives et celles clôturées depuis CLOSED_DAYS jours, de la plus récente
+    à la plus ancienne, et les trois compteurs.
+    """
+    _close_orphans(user, db)
+    since = datetime.now(timezone.utc) - timedelta(days=CLOSED_DAYS)
+    active = _owned_alerts(user, db).filter(Alert.resolved.is_(False)).order_by(Alert.created_at.desc()).all()
+    closed = (
+        _owned_alerts(user, db)
+        .filter(Alert.resolved.is_(True), Alert.resolved_at >= since)
+        .order_by(Alert.resolved_at.desc())
+        .all()
+    )
+    return AlertsOverview(
+        active=[_to_response(a, db) for a in active],
+        closed=[_to_response(a, db) for a in closed],
+        closed_days=CLOSED_DAYS,
+        active_count=len(active),
+        closed_count=len(closed),
+        crops_concerned=len({a.crop_id for a in active if a.crop_id is not None}),
+    )
+
+    
 @router.get("/alerts/count", response_model=AlertCount)
 async def count_open_alerts(
     user: User = Depends(get_current_user),

@@ -53,6 +53,21 @@ class AlertCount(BaseModel):
     open: int
 
 
+
+
+class AlertsOverview(BaseModel):
+    """La page Alertes : alertes actives, clôturées sur 30 jours, et compteurs."""
+
+    active: list[AlertResponse]
+    #: Alertes fermées depuis CLOSED_DAYS jours
+    closed: list[AlertResponse]
+    closed_days: int
+    active_count: int
+    closed_count: int
+    #: Cultures qui ont au moins une alerte active
+    crops_concerned: int
+
+    
 class AlertResolve(BaseModel):
     #: "treated" : problème vérifié et traité ; "false_alarm" : fausse alerte
     resolution: Literal["treated", "false_alarm"] = "treated"
