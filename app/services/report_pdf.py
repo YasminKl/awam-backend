@@ -260,6 +260,24 @@ def build_pdf(report: dict) -> bytes:
             rows.append([label, a["crop_label"] or "—", _day(a["opened"]),
                          _day(a["closed"]) if a["closed"] else "En cours", a["resolution_label"] or "—"])
         body = [_table(rows, [width * 0.34, width * 0.18, width * 0.15, width * 0.15, width * 0.18], st)]
+        # Facteurs de risque de chaque alerte : décision et facteurs signalés
+        for a in alerts:
+            f = a.get("factors") or {}
+            if not f.get("decision"):
+                continue
+            label = "Besoin en eau non couvert" if a["type"] == "Besoin en eau" else a["type"]
+            p = f["anomaly_period"]
+            body.append(Spacer(1, 4))
+            body.append(Paragraph(_clean(
+                f"Facteurs de risque — {label}{' · ' + a['crop_label'] if a['crop_label'] else ''} · "
+                f"période de l'anomalie du {_day(p['start'])} au {_day(p['end'])} · origine probable : {f['decision_label']}"
+            ), st.head))
+            frows = [["Facteur", "Période de l'anomalie", "Depuis le début du stade", "État"]]
+            for x in f["factors"]:
+                state = "Signalé" if x["flagged"] else "Normal" if x["flagged"] is False else "Affiché"
+                cat = "Environnement" if x["category"] == "environnement" else "Pratique"
+                frows.append([f"{x['label']} ({cat})", x["anomaly"] or "—", x["stage"] or "—", state])
+            body.append(_table(frows, [width * 0.2, width * 0.34, width * 0.34, width * 0.12], st))
     else:
         body = [Paragraph("Aucune alerte pendant ce mois.", st.note)]
     story.append(_section("5 · Alertes du mois", body, st))

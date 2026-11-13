@@ -7,7 +7,8 @@ nouveau, les résultats que les autres parties d'AWAM produisent déjà.
   3. Eau                 → impact_service.parcel_impacts, qui utilise le calcul
                            du Suivi de l'irrigation (water_balance_service)
   4. Végétation          → vegetation_service.parcel_vegetation (onglet Végétation)
-  5. Alertes du mois     → la table des alertes (ouvertes pendant le mois)
+   5. Alertes du mois     → la table des alertes (ouvertes pendant le mois), avec
+                           la fiche de leurs facteurs de risque (risk_factor_service)
   6. Arrosages réalisés  → les arrosages faits pendant le mois
 
 Quand une donnée manque, la section le dit : rien n'est estimé.
@@ -31,11 +32,13 @@ from app.services import impact_service as im
 from app.services import vegetation_service as vs
 from app.services.alert_service import RESOLUTION_LABELS, SEVERITY_LABELS
 from app.services.irrigation_service import crop_labels
+from app.services.risk_factor_service import alert_factors
 
 #: Les types d'alertes, tels qu'affichés dans la page Alertes
 ALERT_TYPE_LABELS = {
     "besoin_eau": "Besoin en eau",
     "diagnostic_satellite": "Diagnostic satellitaire",
+    "anomalie_vegetation": "Anomalie de végétation",
 }
 
 
@@ -43,7 +46,7 @@ def _month_bounds(year: int, month: int) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
 
 
-def _alerts(db: Session, parcel: Parcel, start: date, end: date) -> list[dict]:
+def _alerts(db: Session, parcel: Parcel, start: date, end: date, today: date) -> list[dict]:
     """Les alertes de la parcelle qui étaient ouvertes pendant le mois."""
     since = datetime.combine(start, time.min, tzinfo=timezone.utc)
     until = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc)
@@ -68,6 +71,7 @@ def _alerts(db: Session, parcel: Parcel, start: date, end: date) -> list[dict]:
             "opened": a.created_at.date() if a.created_at else None,
             "closed": a.resolved_at.date() if a.resolved_at else None,
             "resolution_label": RESOLUTION_LABELS.get(a.resolution) if a.resolution else None,
+            "factors": alert_factors(db, a, today),
         }
         for a in rows
     ]
@@ -124,6 +128,6 @@ def parcel_month_report(db: Session, parcel: Parcel, year: int, month: int, toda
         "climate": cs.month_conditions(db, parcel.farm_id, year, month, today),
         "impacts": impacts,
         "vegetation": vegetation,
-        "alerts": _alerts(db, parcel, start, end),
+        "alerts": _alerts(db, parcel, start, end, today),
         "waterings": _waterings(db, parcel, start, end),
     }

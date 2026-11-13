@@ -239,6 +239,25 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
                 "⚠️ [ingestion] Archivage du diagnostic impossible (parcel_id=%s)",
                 parcel_id,
             )
+            # ------------------------------------------------------------------
+            # 3 ter. Surveillance de la parcelle : « Anomalie de végétation »
+            # (chaque indice comparé à la plage habituelle de la parcelle)
+            # ------------------------------------------------------------------
+            try:
+                from app.services.vegetation_alert_service import sync_parcel as sync_vegetation_alert
+
+                change = sync_vegetation_alert(db, parcel_id)
+                result["vegetation_alert"] = change
+                if change:
+                    from app.services.events import publish_parcel_event
+
+                    publish_parcel_event(parcel_id, "alerts")
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "⚠️ [ingestion] Surveillance de la parcelle impossible (parcel_id=%s)",
+                    parcel_id,
+                )
         # ------------------------------------------------------------------
         # 4. Mettre à jour raster_status
         # ------------------------------------------------------------------

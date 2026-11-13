@@ -8,11 +8,13 @@ en indiquant si le problème était réel (« traité ») ou non (« fausse
 alerte ») : ces réponses permettront de mesurer la fiabilité des alertes.
 """
 
-from datetime import datetime, timedelta, timezone
+import calendar
+import re
+from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import case, func
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
@@ -26,6 +28,7 @@ from app.models.utilisateur import User
 from app.schemas.alert import AlertCount, AlertHistoryItem, AlertResolve, AlertResponse, AlertsOverview
 from app.services.agronomy.species import SPECIES
 from app.services.alert_service import RESOLUTION_LABELS, SEVERITY_LABELS
+from app.services.risk_factor_service import alert_factors
 
 router = APIRouter(tags=["alerts"])
 
@@ -207,6 +210,52 @@ async def alerts_overview(
     )
 
     
+@router.get("/alerts/{alert_id}/factors")
+async def alert_risk_factors(
+    alert_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """La fiche des facteurs de risque d'une alerte : périodes, facteurs, décision."""
+    alert = _owned_alerts(user, db).filter(Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alerte introuvable.")
+    return {"alert": _to_response(alert, db), "factors": alert_factors(db, alert)}
+
+
+_MONTH = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
+
+
+@router.get("/risk-factors")
+async def risk_factors(
+    month: str = Query(..., description="Mois au format AAAA-MM"),
+    farm_id: int | None = Query(None),
+    parcel_id: int | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Page « Facteurs de risque » : les alertes ouvertes pendant le mois, de
+    toutes les fermes de l'utilisateur, ou d'une ferme ou d'une parcelle, avec
+    la fiche des facteurs de risque de chacune.
+    """
+    match = _MONTH.match(month)
+    if not match:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Mois attendu au format AAAA-MM, par exemple 2026-10.")
+    year, number = int(match.group(1)), int(match.group(2))
+    start = datetime.combine(date(year, number, 1), time.min, tzinfo=timezone.utc)
+    end = datetime.combine(date(year, number, calendar.monthrange(year, number)[1]) + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    query = _owned_alerts(user, db).filter(
+        Alert.created_at < end, or_(Alert.resolved_at.is_(None), Alert.resolved_at >= start),
+    )
+    if farm_id is not None:
+        query = query.filter(Farm.id == farm_id)
+    if parcel_id is not None:
+        query = query.filter(Alert.parcel_id == parcel_id)
+    alerts = query.order_by(Alert.created_at.desc()).all()
+    return [{"alert": _to_response(a, db), "factors": alert_factors(db, a)} for a in alerts]
+
+
 @router.get("/alerts/count", response_model=AlertCount)
 async def count_open_alerts(
     user: User = Depends(get_current_user),
