@@ -8,9 +8,13 @@ Règles :
   - une tâche FAITE (réalisée, ou à entretenir) a une date réelle et au
     moins un employé : ceux qui l'ont vraiment faite ;
   - une NOUVELLE tâche n'est jamais confiée à un employé inactif ;
+  - un employé n'a jamais deux tâches à réaliser au même moment, quelle
+    que soit la parcelle (planning_service) ;
   - la culture choisie doit être sur la parcelle de la tâche ;
   - une tâche attachée l'est à une tâche principale (un seul niveau) ;
-    supprimer la principale supprime ses tâches attachées.
+    supprimer la principale supprime ses tâches attachées ;
+  - une tâche principale et ses tâches attachées sont créées ensemble :
+    toutes sont enregistrées, ou aucune.
 """
 
 from datetime import date, datetime, timedelta, timezone
@@ -26,10 +30,12 @@ from app.models.activity import DONE_STATUSES, STATUS_DONE, STATUS_FOLLOW_UP, ST
 from app.models.crop import Crop
 from app.models.employee import Employee
 from app.models.farm import Farm
+from app.models.irrigation_watering import IrrigationWatering
 from app.models.parcel import Parcel
 from app.models.utilisateur import User
 from app.schemas.activity import ActivityComplete, ActivityCreate, ActivityResponse, ActivityUpdate, FarmHistoryItem
 from app.services.agronomy.species import SPECIES
+from app.services.planning_service import busy_message, window
 from app.services.task_types import canonical_code
 
 router = APIRouter(tags=["activities"])
@@ -107,6 +113,20 @@ def _apply_status(activity: Activity) -> None:
 def _require_people_if_done(activity: Activity) -> None:
     if activity.status in DONE_STATUSES and not activity.employees:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Indiquez au moins un employé qui a fait la tâche.")
+
+
+def _check_available(db: Session, activity: Activity, watering: Optional[IrrigationWatering] = None) -> None:
+    """
+    Tâche à réaliser : ses employés ne doivent pas avoir une autre tâche à
+    réaliser au même moment, quelle que soit la parcelle.
+    """
+    if activity.status != STATUS_PLANNED:
+        return
+    if watering is None and activity.id is not None:
+        watering = db.query(IrrigationWatering).filter(IrrigationWatering.activity_id == activity.id).first()
+    message = busy_message(db, activity.employees, activity.planned_for, window(activity, watering), activity.id)
+    if message:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=message)
 
 
 # ----------------------------------------------------------------------
@@ -250,6 +270,8 @@ async def create_activity(
         parent = _get_owned_activity(payload.parent_id, user, db)
         if parent.parent_id is not None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Une tâche attachée ne peut pas en avoir d'autres.")
+        if payload.attached:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Une tâche attachée ne peut pas en avoir d'autres.")
 
     # Une nouvelle tâche n'est jamais confiée à un employé inactif
     employees = _owned_employees(payload.employee_ids, user, db, require_active=True)
@@ -269,8 +291,28 @@ async def create_activity(
     activity.employees = employees
     _apply_status(activity)
     _require_people_if_done(activity)
+    _check_available(db, activity)
 
     db.add(activity)
+    db.flush()
+
+    # Tâches attachées : mêmes parcelle, culture, équipe et employés que la
+    # principale ; si l'une est refusée, rien n'est enregistré
+    for item in payload.attached:
+        child = Activity(
+            parcel_id=activity.parcel_id,
+            activity_type=canonical_code(db, user.id, item.activity_type),
+            status=STATUS_PLANNED,
+            planned_for=item.planned_for,
+            crop_id=activity.crop_id,
+            team=activity.team,
+            parent_id=activity.id,
+        )
+        child.employees = employees
+        _apply_status(child)
+        _check_available(db, child)
+        db.add(child)
+
     db.commit()
     db.refresh(activity)
     return activity
@@ -305,6 +347,7 @@ async def update_activity(
 
     _apply_status(activity)
     _require_people_if_done(activity)
+    _check_available(db, activity)
     db.commit()
     db.refresh(activity)
     return activity

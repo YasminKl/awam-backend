@@ -125,6 +125,7 @@ from sqlalchemy import or_  # noqa: E402
 
 from app.api.routes.activities import (  # noqa: E402
     _apply_status,
+    _check_available,
     _check_crop,
     _get_owned_activity,
     _owned_employees,
@@ -231,7 +232,9 @@ async def create_watering(payload: WateringCreate, user: User = Depends(get_curr
     _require_people_if_done(activity)
     db.add(activity)
     db.flush()
-    _save_quantity(db, activity, parcel, payload.model_dump(exclude_unset=True), required=activity.status in DONE_STATUSES)
+    watering = _save_quantity(db, activity, parcel, payload.model_dump(exclude_unset=True), required=activity.status in DONE_STATUSES)
+    # Un employé n'a jamais deux tâches à réaliser au même moment
+    _check_available(db, activity, watering)
     db.commit()
     db.refresh(activity)
     return _response(db, activity, parcel)
@@ -255,7 +258,9 @@ async def update_watering(
         )
     _apply_status(activity)
     _require_people_if_done(activity)
-    _save_quantity(db, activity, parcel, changes, required=activity.status in DONE_STATUSES)
+    watering = _save_quantity(db, activity, parcel, changes, required=activity.status in DONE_STATUSES)
+    # Un employé n'a jamais deux tâches à réaliser au même moment
+    _check_available(db, activity, watering)
     db.commit()
     db.refresh(activity)
     return _response(db, activity, parcel)

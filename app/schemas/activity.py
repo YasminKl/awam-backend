@@ -24,6 +24,22 @@ def _with_timezone(v: Optional[datetime]) -> Optional[datetime]:
     return v
 
 
+class AttachedTaskCreate(BaseModel):
+    """
+    Une tâche attachée, créée EN MÊME TEMPS que sa tâche principale : elle
+    reprend la parcelle, la culture, l'équipe et les employés de la
+    principale ; elle a son propre type et sa propre date.
+    """
+
+    activity_type: str
+    planned_for: date
+
+    @field_validator("activity_type")
+    @classmethod
+    def type_valid(cls, v: str) -> str:
+        return _clean_type(v)
+
+
 class ActivityCreate(BaseModel):
     parcel_id: int
     activity_type: str
@@ -40,6 +56,9 @@ class ActivityCreate(BaseModel):
     #: Tâche principale, pour une tâche attachée
     parent_id: Optional[int] = None
     employee_ids: List[int] = []
+    #: Tâches attachées à créer avec celle-ci, en une seule fois : toutes
+    #: sont enregistrées, ou aucune
+    attached: List[AttachedTaskCreate] = []
 
     @field_validator("activity_type")
     @classmethod
