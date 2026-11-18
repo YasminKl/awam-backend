@@ -94,6 +94,13 @@ async def add_farm_employee(
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cet employé est déjà affecté à cette ferme.")
 
+    # Employé inactif : il ne peut être que membre
+    if payload.role == COORDINATOR and employee.is_active is False:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{employee.full_name} est inactif : il ne peut pas être coordinateur. Réactivez-le d'abord.",
+        )
+
     link = FarmEmployee(farm_id=farm_id, employee_id=payload.employee_id, role=payload.role)
     db.add(link)
     db.flush()
@@ -165,6 +172,12 @@ async def update_farm_employee(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Affectation introuvable.")
 
     update_data = payload.model_dump(exclude_unset=True)
+    # Employé inactif : il reste membre, son rôle ne peut pas être changé
+    if "role" in update_data and update_data["role"] != link.role and link.employee.is_active is False:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{link.employee.full_name} est inactif : il reste membre. Réactivez-le pour changer son rôle.",
+        )
     # Équipe : nom ramené à son écriture existante, ou vide (sans équipe)
     if "team" in update_data:
         update_data["team"] = canonical_code(db, user.id, update_data["team"]) if update_data["team"] else None
