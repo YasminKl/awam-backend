@@ -20,8 +20,8 @@ Déclencheurs :
 import logging
 
 from sqlalchemy import text
-from app.services.events import publish_parcel_event
 
+from app.services.events import publish_parcel_event
 from app.db.database import SessionLocal
 from app.services.sentinel_service import (
     generate_all_indices_for_parcel,
@@ -201,7 +201,7 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
                 db.commit()
             except Exception:
                 db.rollback()
-                publish_parcel_event(parcel_id, "indices", scene_date=None)
+            publish_parcel_event(parcel_id, "indices", scene_date=None)
             return result
 
         # ------------------------------------------------------------------
@@ -239,25 +239,6 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
                 "⚠️ [ingestion] Archivage du diagnostic impossible (parcel_id=%s)",
                 parcel_id,
             )
-            # ------------------------------------------------------------------
-            # 3 ter. Surveillance de la parcelle : « Anomalie de végétation »
-            # (chaque indice comparé à la plage habituelle de la parcelle)
-            # ------------------------------------------------------------------
-            try:
-                from app.services.vegetation_alert_service import sync_parcel as sync_vegetation_alert
-
-                change = sync_vegetation_alert(db, parcel_id)
-                result["vegetation_alert"] = change
-                if change:
-                    from app.services.events import publish_parcel_event
-
-                    publish_parcel_event(parcel_id, "alerts")
-            except Exception:
-                db.rollback()
-                logger.exception(
-                    "⚠️ [ingestion] Surveillance de la parcelle impossible (parcel_id=%s)",
-                    parcel_id,
-                )
         # ------------------------------------------------------------------
         # 4. Mettre à jour raster_status
         # ------------------------------------------------------------------
@@ -270,6 +251,7 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
                 "⚠️ [ingestion] Échec mise à jour raster_status (parcel_id=%s)",
                 parcel_id,
             )
+
         # Prévient les pages ouvertes : la courbe se met à jour seule
         publish_parcel_event(parcel_id, "indices", scene_date=result["scene_date"])
         return result
@@ -284,7 +266,7 @@ def ingest_parcel_indices(parcel_id: int, *, force_refresh: bool = False) -> dic
             db.commit()
         except Exception:
             db.rollback()
-            publish_parcel_event(parcel_id, "failed")
+        publish_parcel_event(parcel_id, "failed")
         return result
 
     finally:

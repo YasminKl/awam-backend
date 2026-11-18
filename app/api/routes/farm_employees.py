@@ -139,7 +139,7 @@ async def assign_team(
             )
 
     for link in links:
-        link.team = payload.team or None
+        link.team = team
     db.commit()
 
     return (
@@ -165,15 +165,9 @@ async def update_farm_employee(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Affectation introuvable.")
 
     update_data = payload.model_dump(exclude_unset=True)
-       # Équipe : nom ramené à son écriture existante, ou vide (sans équipe)
+    # Équipe : nom ramené à son écriture existante, ou vide (sans équipe)
     if "team" in update_data:
         update_data["team"] = canonical_code(db, user.id, update_data["team"]) if update_data["team"] else None
-    # Un employé inactif ne rejoint aucune équipe et n'est pas coordinateur
-    if not link.employee.is_active and (update_data.get("team") or update_data.get("role") == "coordinateur"):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Employé inactif : réactivez-le d'abord.",
-        )
     for field, value in update_data.items():
         setattr(link, field, value)
 

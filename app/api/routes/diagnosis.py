@@ -250,6 +250,28 @@ def list_parcel_interpretations(
 # ----------------------------------------------------------------------
 
 
+@router.get("/crops/{crop_id}/needs", response_model=NeedsResponse)
+async def get_crop_needs(
+    crop_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Besoins de la culture : irrigation calculée depuis la météo et le
+    coefficient cultural, fertilisation déduite de la dernière analyse
+    de sol comparée aux références de l'espèce.
+    """
+    crop = _get_owned_crop(crop_id, user, db)
+
+    # Culture clôturée : aucune irrigation ni fertilisation à conseiller
+    closed = _closed_reason(crop)
+    if closed:
+        return NeedsResponse(
+            crop_id=crop_id,
+            closed_reason=closed.replace("plus de suivi satellite", "aucun besoin en eau ni en fertilisation"),
+        )
+
+
     # --- Irrigation ---------------------------------------------------
     # Le même calcul que le Suivi de l'irrigation (water_balance_service) :
     # les 7 derniers jours de météo enregistrée, besoin jour par jour
