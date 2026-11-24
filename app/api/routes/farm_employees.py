@@ -20,6 +20,7 @@ from app.models.farm import Farm
 from app.models.farm_employee import FarmEmployee
 from app.models.employee import Employee
 from app.services.task_types import canonical_code
+from app.services.planning_service import release_employee
 from app.schemas.farm_employee import (
     TeamAssignment,
     FarmEmployeeCreate,
@@ -204,6 +205,9 @@ async def remove_farm_employee(
     if not link:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Affectation introuvable.")
 
+    # Retiré de cette ferme : il quitte ses tâches à venir dans ses parcelles ;
+    # celles dont il était le seul employé sont supprimées
+    release_employee(db, link.employee, farm_id=farm_id)
     db.delete(link)
     db.commit()
     return None

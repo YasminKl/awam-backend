@@ -114,3 +114,37 @@ def busy_message(
                 f"sur la parcelle {parcel.name if parcel else ''} ({label})."
             )
     return None
+
+
+
+
+def release_employee(db: Session, employee: Employee, farm_id: Optional[int] = None) -> dict:
+    """
+    Retire un employé de ses tâches À RÉALISER : toutes (employé rendu
+    inactif), ou celles des parcelles d'une ferme (employé retiré de cette
+    ferme). Une tâche dont il était le SEUL employé est supprimée, avec ses
+    tâches attachées. Les tâches déjà faites ne sont pas touchées : elles
+    restent dans l'historique. Ne valide pas la transaction (commit).
+
+    Renvoie {"removed": n, "deleted": n} : tâches gardées sans lui, tâches
+    supprimées.
+    """
+    query = db.query(Activity).filter(
+        Activity.status == STATUS_PLANNED,
+        Activity.employees.any(Employee.id == employee.id),
+    )
+    if farm_id is not None:
+        query = query.join(Parcel, Activity.parcel_id == Parcel.id).filter(Parcel.farm_id == farm_id)
+    removed = deleted = 0
+    # Tâches attachées d'abord : supprimer une principale supprime aussi les siennes
+    for activity in query.order_by(Activity.parent_id.is_(None)).all():
+        if activity in db.deleted:
+            continue
+        if len(activity.employees) <= 1:
+            db.delete(activity)
+            deleted += 1
+        else:
+            activity.employees.remove(employee)
+            removed += 1
+    db.flush()
+    return {"removed": removed, "deleted": deleted}

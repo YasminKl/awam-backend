@@ -55,8 +55,8 @@ from app.services.agronomy.species import (
 
 router = APIRouter(tags=["crops"])
 
-#: Types d'activité qui marquent une récolte
-HARVEST_TYPES = {"recolte", "récolte", "harvest", "coupe"}
+#: Types d'activité qui marquent une récolte (définis avec les types de tâches)
+from app.services.task_types import HARVEST_TYPES  # noqa: E402
 
 
 # ----------------------------------------------------------------------

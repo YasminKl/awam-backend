@@ -31,6 +31,17 @@ from app.models.farm import Farm
 from app.models.farm_employee import FarmEmployee
 from app.models.parcel import Parcel
 
+
+#: Types de tâche qui marquent une récolte (récolte ou coupe) : une telle
+#: tâche concerne UNE culture, qui doit être désignée
+HARVEST_TYPES = {"recolte", "récolte", "harvest", "coupe"}
+
+
+def is_harvest(activity_type: str | None) -> bool:
+    """Vrai si le type de tâche est une récolte ou une coupe."""
+    return (activity_type or "").strip().lower() in HARVEST_TYPES
+
+    
 #: Types prédéfinis : (code, libellé). Les codes sont ceux des activités.
 PREDEFINED_TASK_TYPES: list[tuple[str, str]] = [
     ("plantation", "Plantation"),

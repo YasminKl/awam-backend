@@ -1,3 +1,4 @@
+import re
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
@@ -9,6 +10,28 @@ from app.api.routes.auth import get_current_user
 from app.schemas.farm import FarmCreate, FarmUpdate, FarmResponse
 
 router = APIRouter(prefix="/farms", tags=["farms"])
+
+#: Comparaison des noms : sans espaces autour, espaces multiples réduits,
+#: sans tenir compte des majuscules (« Kemel 1 » = « kemel  1 »)
+_NAME_KEY_SQL = r"lower(regexp_replace(btrim(name), '\s+', ' ', 'g'))"
+
+
+def _name_key(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+def _check_farm_name_free(db: Session, user_id: int, name: str, exclude_id: int | None = None) -> None:
+    """Deux fermes d'un même compte ne portent jamais le même nom."""
+    taken = db.execute(
+        text(f"SELECT 1 FROM farm WHERE user_id = :user_id AND {_NAME_KEY_SQL} = :key"
+             " AND (CAST(:exclude_id AS INTEGER) IS NULL OR id <> :exclude_id) LIMIT 1"),
+        {"user_id": user_id, "key": _name_key(name), "exclude_id": exclude_id},
+    ).fetchone()
+    if taken:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Une ferme nommée « {name.strip()} » existe déjà dans votre compte.",
+        )
 
 
 @router.get("", response_model=list[FarmResponse])
@@ -34,6 +57,7 @@ async def create_farm(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _check_farm_name_free(db, current_user.id, payload.name)
     result = db.execute(
         text("""
             INSERT INTO farm (user_id, name, location, latitude, longitude)
@@ -58,6 +82,13 @@ async def create_farm(
     return dict(row._mapping)
 
 
+def _moved(old: float | None, new: float | None) -> bool:
+    """Vrai si une coordonnée change (ajoutée, retirée ou différente)."""
+    if old is None or new is None:
+        return (old is None) != (new is None)
+    return abs(old - new) > 1e-7
+
+
 def _launch_weather_history(farm_id: int) -> None:
     """Historique météo de la ferme en arrière-plan ; une panne ne bloque rien."""
     try:
@@ -76,13 +107,20 @@ async def update_farm(
     db: Session = Depends(get_db),
 ):
     existing = db.execute(
-        text("SELECT id FROM farm WHERE id = :farm_id AND user_id = :user_id"),
+        text("SELECT id, name, latitude, longitude FROM farm WHERE id = :farm_id AND user_id = :user_id"),
         {"farm_id": farm_id, "user_id": current_user.id},
     ).fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Ferme introuvable ou non autorisée.")
 
     update_data = payload.model_dump(exclude_unset=True)
+    # La position change-t-elle vraiment ? (renommer la ferme ne la change pas)
+    new_lat = update_data["latitude"] if "latitude" in update_data else existing.latitude
+    new_lon = update_data["longitude"] if "longitude" in update_data else existing.longitude
+    position_changed = _moved(existing.latitude, new_lat) or _moved(existing.longitude, new_lon)
+    # Nom vérifié seulement s'il change (une ferme déjà en double reste modifiable)
+    if update_data.get("name") and _name_key(update_data["name"]) != _name_key(existing.name):
+        _check_farm_name_free(db, current_user.id, update_data["name"], exclude_id=farm_id)
     if not update_data:
         # Aucun champ fourni : on renvoie la ferme telle quelle, sans écrire en base.
         row = db.execute(
@@ -110,8 +148,23 @@ async def update_farm(
         """),
         params,
     )
-    db.commit()
     row = result.fetchone()
+
+    if position_changed:
+        # Nouveau lieu : la météo enregistrée vient de l'ancien. Elle est
+        # supprimée, avec le lieu de la projection climatique (qui garde sa
+        # propre copie de l'ancienne position ; ses données suivent par
+        # cascade). Le tout dans la même transaction que la modification.
+        db.execute(text("DELETE FROM weather_daily WHERE farm_id = :farm_id"), {"farm_id": farm_id})
+        db.execute(text("DELETE FROM weather_forecast WHERE farm_id = :farm_id"), {"farm_id": farm_id})
+        db.execute(text("DELETE FROM climate_site WHERE farm_id = :farm_id"), {"farm_id": farm_id})
+    db.commit()
+
+    if position_changed:
+        # Historique depuis 2020 au nouveau lieu, en arrière-plan. Si Celery
+        # est indisponible, la tâche du matin le reprend (ferme sans météo),
+        # et la tâche horaire du climat recrée le lieu à la nouvelle position.
+        _launch_weather_history(farm_id)
     return dict(row._mapping)
 
 

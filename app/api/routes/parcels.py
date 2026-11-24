@@ -30,10 +30,12 @@ Une parcelle inactive ne reçoit aucune analyse : son raster_status vaut
 
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.models.farm import Farm
@@ -43,6 +45,77 @@ from app.models.utilisateur import User
 from app.api.routes.auth import get_current_user
 from app.schemas.parcel import ParcelCreate, ParcelResponse, ParcelUpdate
 from app.services.b2_storage import generate_presigned_url
+
+#: Comparaison des noms : sans espaces autour, espaces multiples réduits,
+#: sans tenir compte des majuscules (« Kemel 1 » = « kemel  1 »)
+_NAME_KEY_SQL = r"lower(regexp_replace(btrim(name), '\s+', ' ', 'g'))"
+
+
+def _name_key(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+def _check_parcel_name_free(db: Session, farm_id: int, name: str, exclude_id: int | None = None) -> None:
+    """Deux parcelles d'une même ferme ne portent jamais le même nom."""
+    taken = db.execute(
+        text(f"SELECT 1 FROM parcel WHERE farm_id = :farm_id AND {_NAME_KEY_SQL} = :key"
+             " AND (CAST(:exclude_id AS INTEGER) IS NULL OR id <> :exclude_id) LIMIT 1"),
+        {"farm_id": farm_id, "key": _name_key(name), "exclude_id": exclude_id},
+    ).fetchone()
+    if taken:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Une parcelle nommée « {name.strip()} » existe déjà dans cette ferme.",
+        )
+
+def _check_geometry(db: Session, geometry: dict[str, Any]) -> None:
+    """
+    Le contour d'une parcelle est UNE surface fermée et valide : la colonne
+    geom de la base est de type POLYGON. Refuse, avec un message clair, un
+    point, une ligne, plusieurs morceaux, moins de 3 coins, des coins
+    alignés ou des côtés qui se croisent. Le contour n'est jamais réparé
+    en silence : l'utilisateur le redessine.
+    """
+    def refuse(message: str) -> None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message)
+
+    kind = geometry.get("type") if isinstance(geometry, dict) else None
+    if kind == "MultiPolygon":
+        refuse("Une parcelle doit être d'un seul tenant : pour plusieurs blocs, créez plusieurs parcelles.")
+    if kind != "Polygon" or not isinstance(geometry.get("coordinates"), list) or not geometry["coordinates"]:
+        refuse("Le contour de la parcelle doit être une surface fermée (polygone).")
+    ring = geometry["coordinates"][0]
+    try:
+        points = {(float(p[0]), float(p[1])) for p in ring}
+    except (TypeError, ValueError, IndexError):
+        refuse("Le contour de la parcelle contient des coordonnées illisibles.")
+    if len(points) < 3:
+        refuse("Le contour de la parcelle doit avoir au moins 3 coins différents.")
+    if any(not (-180 <= lon <= 180 and -90 <= lat <= 90) for lon, lat in points):
+        refuse("Le contour de la parcelle contient des coordonnées hors limites.")
+    try:
+        check = db.execute(
+            text("""
+                SELECT ST_IsValid(g) AS valid, ST_IsValidReason(g) AS reason,
+                       ST_Area(g::geography) AS area,
+                       ST_Area(ST_ConvexHull(g)::geography) AS hull_area
+                FROM (SELECT ST_SetSRID(ST_GeomFromGeoJSON(:geom), 4326) AS g) AS t
+            """),
+            {"geom": json.dumps(geometry)},
+        ).fetchone()
+    except DBAPIError:
+        db.rollback()
+        refuse("Le contour de la parcelle n'est pas un polygone valide.")
+    # Tous les coins sur une même ligne : aucune surface
+    if not check.hull_area or check.hull_area <= 0:
+        refuse("Les coins du contour sont alignés : la surface de la parcelle est nulle.")
+    if not check.valid:
+        if "intersection" in (check.reason or "").lower():
+            refuse("Les côtés du contour se croisent : redessinez la parcelle.")
+        refuse("Le contour de la parcelle n'est pas valide : redessinez-la.")
+    if not check.area or check.area <= 0:
+        refuse("La surface de la parcelle est nulle.")
+
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +291,10 @@ def create_parcel(
     ).fetchone()
     if not farm:
         raise HTTPException(404, "Ferme introuvable ou non autorisée")
+
+    # Nom unique dans la ferme, puis contour, vérifiés avant tout enregistrement
+    _check_parcel_name_free(db, payload.farm_id, payload.name)
+    _check_geometry(db, payload.geometry)
 
     geom_json = json.dumps(payload.geometry)
 
@@ -455,7 +532,7 @@ def update_parcel(
 ):
     existing = db.execute(
         text("""
-            SELECT p.id, p.status FROM parcel p
+            SELECT p.id, p.status, p.name, p.farm_id FROM parcel p
             JOIN farm f ON f.id = p.farm_id
             WHERE p.id = :parcel_id AND f.user_id = :user_id
         """),
@@ -463,6 +540,14 @@ def update_parcel(
     ).fetchone()
     if not existing:
         raise HTTPException(404, "Parcelle introuvable")
+
+    # Nom vérifié seulement s'il change (une parcelle déjà en double reste modifiable)
+    if payload.name is not None and _name_key(payload.name) != _name_key(existing.name):
+        _check_parcel_name_free(db, existing.farm_id, payload.name, exclude_id=parcel_id)
+
+    # Nouveau contour vérifié avant tout enregistrement
+    if payload.geometry is not None:
+        _check_geometry(db, payload.geometry)
 
     # Statut après la mise à jour, et passage éventuel inactive → active
     new_status = payload.status if payload.status is not None else existing.status

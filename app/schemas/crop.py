@@ -119,6 +119,14 @@ class CropBase(BaseModel):
             raise ValueError("La densité doit être un nombre positif.")
         return v
 
+    @field_validator("variety")
+    @classmethod
+    def variety_length(cls, v: Optional[str]) -> Optional[str]:
+        # Même limite que la colonne de la base (100 caractères)
+        if v is not None and len(v) > 100:
+            raise ValueError("La variété ne doit pas dépasser 100 caractères.")
+        return v
+
     @field_validator("actual_yield")
     @classmethod
     def yield_positive(cls, v: Optional[float]) -> Optional[float]:
@@ -171,6 +179,23 @@ class CropUpdate(BaseModel):
     def yield_positive(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and v <= 0:
             raise ValueError("La production doit être un nombre positif.")
+        return v
+
+    # Même règle qu'à la création (CropBase) : sans elle, une densité nulle ou
+    # négative était enregistrée, puis la culture ne pouvait plus être relue
+    @field_validator("density")
+    @classmethod
+    def density_positive(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError("La densité doit être un nombre positif.")
+        return v
+
+    @field_validator("variety")
+    @classmethod
+    def variety_length(cls, v: Optional[str]) -> Optional[str]:
+        # Même limite que la colonne de la base (100 caractères)
+        if v is not None and len(v) > 100:
+            raise ValueError("La variété ne doit pas dépasser 100 caractères.")
         return v
 
     @field_validator("species")

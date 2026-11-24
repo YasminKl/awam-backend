@@ -1,3 +1,4 @@
+import re
 from typing import Optional
 from pydantic import BaseModel, field_validator
 
@@ -24,6 +25,9 @@ class EmployeeCreate(BaseModel):
         v = v.strip()
         if len(v) > 30:
             raise ValueError("Le numéro de téléphone ne doit pas dépasser 30 caractères.")
+        # Chiffres, espaces et signes + ( ) - . seulement, ex. « (+216) 20 123 456 »
+        if not re.fullmatch(r"[0-9+()\-.\s]*", v):
+            raise ValueError("Le téléphone ne peut contenir que des chiffres, des espaces et les signes + ( ) - .")
         return v or None
 
 
@@ -53,6 +57,9 @@ class EmployeeUpdate(BaseModel):
         v = v.strip()
         if len(v) > 30:
             raise ValueError("Le numéro de téléphone ne doit pas dépasser 30 caractères.")
+        # Chiffres, espaces et signes + ( ) - . seulement, ex. « (+216) 20 123 456 »
+        if not re.fullmatch(r"[0-9+()\-.\s]*", v):
+            raise ValueError("Le téléphone ne peut contenir que des chiffres, des espaces et les signes + ( ) - .")
         return v or None
 
 

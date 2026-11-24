@@ -36,7 +36,7 @@ from app.models.utilisateur import User
 from app.schemas.activity import ActivityComplete, ActivityCreate, ActivityResponse, ActivityUpdate, FarmHistoryItem
 from app.services.agronomy.species import SPECIES
 from app.services.planning_service import busy_message, window
-from app.services.task_types import canonical_code
+from app.services.task_types import canonical_code, is_harvest
 
 router = APIRouter(tags=["activities"])
 
@@ -113,6 +113,15 @@ def _apply_status(activity: Activity) -> None:
 def _require_people_if_done(activity: Activity) -> None:
     if activity.status in DONE_STATUSES and not activity.employees:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Indiquez au moins un employé qui a fait la tâche.")
+
+
+def _require_crop_if_harvest(activity_type: Optional[str], crop_id: Optional[int]) -> None:
+    """Une récolte ou une coupe concerne une culture précise de la parcelle."""
+    if is_harvest(activity_type) and crop_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Choisissez la culture récoltée : une récolte ou une coupe concerne une seule culture.",
+        )
 
 
 def _check_available(db: Session, activity: Activity, watering: Optional[IrrigationWatering] = None) -> None:
@@ -289,6 +298,7 @@ async def create_activity(
         parent_id=payload.parent_id,
     )
     activity.employees = employees
+    _require_crop_if_harvest(activity.activity_type, activity.crop_id)
     _apply_status(activity)
     _require_people_if_done(activity)
     _check_available(db, activity)
@@ -308,6 +318,7 @@ async def create_activity(
             team=activity.team,
             parent_id=activity.id,
         )
+        _require_crop_if_harvest(child.activity_type, child.crop_id)
         child.employees = employees
         _apply_status(child)
         _check_available(db, child)
@@ -338,6 +349,10 @@ async def update_activity(
     for field, value in update_data.items():
         setattr(activity, field, value)
     _check_crop(activity.crop_id, activity.parcel_id, db)
+    # Seulement si le type ou la culture changent : marquer « réalisée » une
+    # ancienne récolte sans culture reste possible
+    if "activity_type" in update_data or "crop_id" in update_data:
+        _require_crop_if_harvest(activity.activity_type, activity.crop_id)
 
     if payload.employee_ids is not None:
         # Tâche encore à faire : seulement des employés actifs

@@ -18,6 +18,7 @@ from app.models.employee import Employee
 from app.models.farm_employee import FarmEmployee
 from app.models.utilisateur import User
 from app.schemas.employee import EmployeeCreate, EmployeeResponse, EmployeeUpdate
+from app.services.planning_service import release_employee
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -91,6 +92,9 @@ async def update_employee(
             link.team = None
             if link.role == "coordinateur":
                 link.role = "membre"
+        # Un employé inactif n'a plus de tâches à venir : il en est retiré, et
+        # celles dont il était le seul employé sont supprimées
+        release_employee(db, employee)
 
     db.commit()
     db.refresh(employee)
