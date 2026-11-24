@@ -194,7 +194,8 @@ def parcel_report_pdf(
     """Le même rapport, en PDF à télécharger."""
     report = _report(parcel_id, month, user, db)
     pdf = report_pdf.build_pdf(report)
-    safe = "".join(ch if ch.isalnum() else "-" for ch in report["parcel_name"]).strip("-") or "parcelle"
+    # Lettres et chiffres gardés ; chaque suite d'autres caractères devient un seul tiret
+    safe = re.sub(r"[^0-9A-Za-zÀ-ÿ]+", "-", report["parcel_name"]).strip("-") or "parcelle"
     filename = f"rapport-{safe}-{report['month']}.pdf"
     return Response(
         content=pdf,

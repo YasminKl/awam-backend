@@ -82,6 +82,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Le front lit le nom du fichier d'un téléchargement (rapport PDF)
+    expose_headers=["Content-Disposition"],
 )
 print(f"🔵 CORS configuré avec FRONTEND_URL = {FRONTEND_URL}")
 

@@ -15,11 +15,13 @@ from sqlalchemy.orm import Session
 from app.core.security import get_current_user
 from app.db.database import get_db
 from app.models.activity import DONE_STATUSES, Activity
+from app.models.alert import Alert
 from app.models.crop import Crop
 from app.models.crop_observation import CropObservation
 from app.models.farm import Farm
 from app.models.parcel import Parcel
 from app.models.utilisateur import User
+from app.services.events import publish_parcel_event
 from app.schemas.crop import (
     CropCreate,
     ExpectedHarvestPreview,
@@ -513,8 +515,15 @@ def delete_crop(
     db: Session = Depends(get_db),
 ):
     crop = _get_owned_crop(crop_id, user, db)
+    parcel_id = crop.parcel_id
+    # Une culture supprimée emporte ses alertes, ouvertes ou fermées, comme
+    # son historique (sinon la base les garderait, sans culture, ouvertes)
+    deleted_alerts = db.query(Alert).filter(Alert.crop_id == crop.id).delete(synchronize_session=False)
     db.delete(crop)
     db.commit()
+    if deleted_alerts:
+        # La cloche et la page Alertes se mettent à jour seules
+        publish_parcel_event(parcel_id, "alerts")
     return None
 
 
