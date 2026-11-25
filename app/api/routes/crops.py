@@ -6,7 +6,7 @@ référentiel agronomique. C'est elle qui donne le contexte nécessaire au
 diagnostic : sans culture déclarée, aucun stade ni seuil ne s'applique.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -14,8 +14,9 @@ from sqlalchemy.orm import Session
 
 from app.core.security import get_current_user
 from app.db.database import get_db
-from app.models.activity import DONE_STATUSES, Activity
+from app.models.activity import DONE_STATUSES, STATUS_DONE, Activity
 from app.models.alert import Alert
+from app.api.routes.activities import _owned_employees
 from app.models.crop import Crop
 from app.models.crop_observation import CropObservation
 from app.models.farm import Farm
@@ -441,6 +442,12 @@ def create_crop(
     data = payload.model_dump()
     # La récolte prévue est toujours calculée : une date envoyée est ignorée
     data.pop("expected_harvest_date", None)
+    # Employés de la plantation : la tâche est créée avec la culture
+    planting_employee_ids = data.pop("planting_employee_ids", [])
+    # Vérifiés avant tout enregistrement : employés du compte, actifs
+    planting_employees = (
+        _owned_employees(planting_employee_ids, user, db, require_active=True) if planting_employee_ids else []
+    )
 
     crop = Crop(**data)
     if not is_orchard(crop.species):
@@ -453,6 +460,26 @@ def create_crop(
         crop.expected_harvest_date = None
 
     db.add(crop)
+    if planting_employees:
+        # Tâche « Plantation » réalisée, rattachée à la culture, à sa date de
+        # plantation : elle apparaît dans la planification et l'historique.
+        # Enregistrée dans la même transaction : la culture et sa tâche, ou rien
+        db.flush()
+        task = Activity(
+            parcel_id=crop.parcel_id,
+            activity_type="plantation",
+            status=STATUS_DONE,
+            # Plantée aujourd'hui : l'heure de l'enregistrement, jamais une heure
+            # future ; un jour passé : midi (le formulaire ne donne pas l'heure)
+            performed_at=(
+                datetime.now(timezone.utc)
+                if crop.planting_date >= datetime.now(timezone.utc).date()
+                else datetime.combine(crop.planting_date, time(12, 0), tzinfo=timezone.utc)
+            ),
+            crop_id=crop.id,
+        )
+        task.employees = planting_employees
+        db.add(task)
     db.commit()
     db.refresh(crop)
     return _to_response(crop)

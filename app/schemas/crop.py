@@ -142,7 +142,11 @@ class CropCreate(CropBase):
     #: l'agronome), le stade des cultures annuelles, la récolte prévue et
     #: le point de départ de l'historique. Une date approximative suffit.
     planting_date: date
-
+    #: Employés qui ont planté : si la liste n'est pas vide, une tâche
+    #: « Plantation » réalisée est créée avec la culture, à sa date de
+    #: plantation (comme un arrosage fait devient une tâche)
+    planting_employee_ids: list[int] = []
+    
     @model_validator(mode="after")
     def dates_coherent(self) -> "CropCreate":
         check_crop_dates(self.planting_date, self.expected_harvest_date, self.actual_harvest_date)
